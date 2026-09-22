@@ -405,6 +405,14 @@ impl CodexProvider {
                 // Second consecutive empty after a successful tool_result tail: the
                 // empty IS the turn's end — let it translate into a valid empty
                 // end_turn (see accept_empty_completion).
+                log.info(
+                    "codex_empty_completion_accepted",
+                    Some(serde_json::Map::from_iter([
+                        ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                        ("transport".to_string(), serde_json::json!("buffered")),
+                        ("attempt".to_string(), serde_json::json!(attempt)),
+                    ])),
+                );
                 break response;
             }
             // A successful terminal event with no output would translate into
@@ -964,6 +972,16 @@ async fn live_stream_response_once(
         {
             return provider_retry(&upstream_events, empty_live_completion_error());
         }
+        if terminal && is_codex_success_terminal_event(&payload) && !translator.has_semantic_output()
+        {
+            create_logger("codex").info(
+                "codex_empty_completion_accepted",
+                Some(serde_json::Map::from_iter([
+                    ("reqId".to_string(), serde_json::json!(&ctx.req_id)),
+                    ("transport".to_string(), serde_json::json!("live")),
+                ])),
+            );
+        }
         if translator.has_semantic_output() && !pending_chunk.is_empty() {
             record_live_stream_downstream_capture(&ctx, &pending_chunk);
             record_live_stream_progress(&ctx, &pending_chunk);
@@ -1031,7 +1049,16 @@ async fn live_stream_response_once(
 /// An `is_error` tail is deliberately excluded: an error result demands a model reaction,
 /// so a deterministic empty there stays a loud failure.
 fn tail_is_successful_tool_result(body: &MessagesRequest) -> bool {
-    let Some(last) = body.messages.last() else {
+    // Claude Code appends hook output after the tool result: as trailing `text`
+    // blocks in the same user message and as trailing `system`-role messages
+    // (observed 2026-09-22 with claude-code 2.1.278 after SubagentHandback).
+    // Neither is a model turn, so look through them to the last tool result.
+    let Some(last) = body
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role != "system")
+    else {
         return false;
     };
     if last.role != "user" {
@@ -1040,10 +1067,17 @@ fn tail_is_successful_tool_result(body: &MessagesRequest) -> bool {
     let Some(blocks) = last.content.as_array() else {
         return false;
     };
-    let Some(block) = blocks.last() else {
+    let Some(index) = blocks
+        .iter()
+        .rposition(|block| block.get("type").and_then(|v| v.as_str()) == Some("tool_result"))
+    else {
         return false;
     };
-    block.get("type").and_then(|v| v.as_str()) == Some("tool_result")
+    let block = &blocks[index];
+    let trailing_is_text = blocks[index + 1..]
+        .iter()
+        .all(|b| b.get("type").and_then(|v| v.as_str()) == Some("text"));
+    trailing_is_text
         && !block
             .get("is_error")
             .and_then(|v| v.as_bool())
@@ -1945,6 +1979,24 @@ mod tests {
     }
 
     #[test]
+    fn hook_output_after_the_tool_result_is_looked_through() {
+        // Both shapes captured from claude-code 2.1.278 after SubagentHandback.
+        let trailing_system = request_with_tail(serde_json::json!([
+            {"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"sent"}]},
+            {"role":"system","content":[{"type":"text","text":"PostToolUse hook context"}]}
+        ]));
+        assert!(tail_is_successful_tool_result(&trailing_system));
+        let trailing_text_and_system = request_with_tail(serde_json::json!([
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"sent"},
+                {"type":"text","text":"<system-reminder>…</system-reminder>"}
+            ]},
+            {"role":"system","content":[{"type":"text","text":"PostToolUse hook context"}]}
+        ]));
+        assert!(tail_is_successful_tool_result(&trailing_text_and_system));
+    }
+
+    #[test]
     fn non_tool_tails_are_excluded() {
         // plain-text user tail
         let text = request_with_tail(serde_json::json!([{"role":"user","content":"ping"}]));
@@ -1955,14 +2007,22 @@ mod tests {
             {"role":"assistant","content":[{"type":"text","text":"pong"}]}
         ]));
         assert!(!tail_is_successful_tool_result(&assistant));
-        // tool_result present but NOT the last block
+        // tool_result followed by a non-text block
         let not_last = request_with_tail(serde_json::json!([
             {"role":"user","content":[
                 {"type":"tool_result","tool_use_id":"t1","content":"sent"},
-                {"type":"text","text":"and also this"}
+                {"type":"image","source":{"type":"base64","media_type":"image/png","data":""}}
             ]}
         ]));
         assert!(!tail_is_successful_tool_result(&not_last));
+        // an error tool_result behind a trailing system message is still excluded
+        let error_then_system = request_with_tail(serde_json::json!([
+            {"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"boom","is_error":true}
+            ]},
+            {"role":"system","content":[{"type":"text","text":"hook output"}]}
+        ]));
+        assert!(!tail_is_successful_tool_result(&error_then_system));
         // empty conversation
         let empty = request_with_tail(serde_json::json!([]));
         assert!(!tail_is_successful_tool_result(&empty));
