@@ -48,6 +48,10 @@ Sign in with a **ChatGPT Plus or Pro account**, not an OpenAI API account:
 claude-code-proxy codex auth login
 ```
 
+Already signed in to the Codex CLI? Set `CCP_CODEX_AUTH_FILE=codex-cli` to share
+its login instead. See
+[Codex](https://claude-code-proxy.raine.dev/providers/codex/#share-the-codex-cli-login).
+
 Start the proxy in one terminal:
 
 ```sh

@@ -22,7 +22,15 @@ claude-code-proxy codex auth device
 claude-code-proxy codex auth status
 ```
 
-The proxy owns its tokens and does not read native Codex CLI credentials. It refreshes expiring access tokens with a single-flight guard. See [Files and storage](/reference/files-and-storage/) for credential locations.
+By default the proxy owns its tokens and does not read native Codex CLI credentials. It refreshes expiring access tokens with a single-flight guard. See [Files and storage](/reference/files-and-storage/) for credential locations.
+
+### Share the Codex CLI login
+
+Set `CCP_CODEX_AUTH_FILE=codex-cli`, or `"codex": { "authFile": "codex-cli" }` in `config.json`, to use the Codex CLI's login instead of a separate proxy login. The proxy then reads `$CODEX_HOME/auth.json`, or `~/.codex/auth.json` when `CODEX_HOME` is unset. Any other value is the path of a file in the same format. An empty `CCP_CODEX_AUTH_FILE` turns the setting off for that process.
+
+The Codex CLI and the proxy then share one login. Before refreshing an access token, the proxy re-reads the file and uses the Codex CLI's tokens if they changed. Otherwise it refreshes and writes the new tokens back into the same file: it replaces the file atomically, keeps every other field, and updates `last_refresh`. Proxy processes sharing the file serialize refreshes with a lock file next to it (`auth.json.ccp-lock`). The Codex CLI does not take that lock, so the proxy checks the file again before writing and keeps the Codex CLI's tokens if they changed during the refresh.
+
+With the setting on, `codex auth status` names the file in use, and `codex auth login`, `device`, and `logout` refuse to run; sign in and out with `codex login` and `codex logout`. A file holding only an `OPENAI_API_KEY` is rejected because the proxy needs a ChatGPT login.
 
 ## Models and fast mode
 

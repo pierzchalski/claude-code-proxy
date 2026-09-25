@@ -33,7 +33,9 @@ Kimi and Grok use `<configuration-root>/<provider>/auth.json` on every platform.
 When `CCP_CONFIG_DIR` is set, file-backed provider credentials use
 `<CCP_CONFIG_DIR>/<provider>/auth.json`, including Codex and Cursor on macOS.
 `CCP_CURSOR_AUTH_TOKEN` bypasses Cursor's local credential store for that
-process.
+process. `CCP_CODEX_AUTH_FILE` or `codex.authFile` points Codex at the Codex
+CLI's `auth.json` instead of the proxy's store; see
+[Codex](/providers/codex/#share-the-codex-cli-login).
 
 OpenCode Go is the exception: it reads its API key from
 `CCP_OPENCODE_API_KEY`, `OPENCODE_API_KEY`, or `opencode.apiKey` in

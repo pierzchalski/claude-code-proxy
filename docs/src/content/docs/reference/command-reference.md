@@ -84,6 +84,8 @@ A missing credential makes `auth status` exit with status 1. Other provider comm
 
 Logout removes the local proxy-owned credential. It does not call the provider to revoke a refresh token.
 
+When Codex shares the Codex CLI's login (`codex.authFile`), `codex auth login`, `device`, and `logout` refuse to run, and `codex auth status` names the Codex CLI file in use.
+
 ## Development commands
 
 From a source checkout:
