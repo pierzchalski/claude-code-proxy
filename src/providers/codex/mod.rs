@@ -1661,8 +1661,22 @@ fn codex_error_message(err: &client::CodexError) -> &str {
 
 pub(crate) struct CodexCli;
 
+/// Refuse a ccp login/logout when ccp is set to use the Codex CLI's login.
+fn refuse_when_sharing_codex_cli_login(command: &str) -> Result<(), anyhow::Error> {
+    match crate::config::codex_auth_file() {
+        Some(path) => anyhow::bail!(
+            "codex.authFile / CCP_CODEX_AUTH_FILE is set, so ccp uses the Codex CLI's login in {}; \
+             `claude-code-proxy codex auth {command}` would not change it. \
+             Use `codex login` / `codex logout`, or unset the setting to use ccp's own login.",
+            path.display()
+        ),
+        None => Ok(()),
+    }
+}
+
 impl CliHandlers for CodexCli {
     fn login(&self) -> Result<(), anyhow::Error> {
+        refuse_when_sharing_codex_cli_login("login")?;
         let tokens = run_browser_login()?;
         let store = file_store();
         let manager = CodexAuthManager::new(store);
@@ -1675,6 +1689,7 @@ impl CliHandlers for CodexCli {
     }
 
     fn device(&self) -> Result<(), anyhow::Error> {
+        refuse_when_sharing_codex_cli_login("device")?;
         let tokens = DeviceAuthClient::new().run()?;
         let store = file_store();
         let manager = CodexAuthManager::new(store);
@@ -1695,8 +1710,18 @@ impl CliHandlers for CodexCli {
                     "Account: {}",
                     auth.account_id.as_deref().unwrap_or("(none)")
                 );
-                println!("{}", format_expiry(auth.expires, now_ms()));
-                println!("Storage: {}", store.auth_path());
+                if auth.expires == u64::MAX {
+                    println!("Expires: unknown (access token has no exp claim)");
+                } else {
+                    println!("{}", format_expiry(auth.expires, now_ms()));
+                }
+                match crate::config::codex_auth_file() {
+                    Some(_) => println!(
+                        "Storage: {} (Codex CLI login, via codex.authFile / CCP_CODEX_AUTH_FILE)",
+                        store.auth_path()
+                    ),
+                    None => println!("Storage: {}", store.auth_path()),
+                }
                 Ok(())
             }
             None => {
@@ -1706,6 +1731,7 @@ impl CliHandlers for CodexCli {
     }
 
     fn logout(&self) -> Result<(), anyhow::Error> {
+        refuse_when_sharing_codex_cli_login("logout")?;
         let store = file_store();
         store.clear_auth()?;
         println!("Logged out");

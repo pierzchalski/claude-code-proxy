@@ -78,6 +78,8 @@ struct CodexConfig {
     pub transport: Option<String>,
     #[serde(rename = "headerTimeoutMs")]
     pub header_timeout_ms: Option<u64>,
+    #[serde(rename = "authFile")]
+    pub auth_file: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -271,6 +273,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
     if env.contains_key("CCP_CODEX_TRANSCRIPTIONS_API") {
         out.push("codex.transcriptionsApi (env)".to_string());
     }
+    if env.contains_key("CCP_CODEX_AUTH_FILE") {
+        out.push("codex.authFile (env)".to_string());
+    }
     if env.contains_key("CCP_KIMI_OAUTH_HOST") {
         out.push("kimi.oauthHost (env)".to_string());
     }
@@ -368,6 +373,9 @@ pub fn config_override_summary_lines(cfg: &LoadedConfig) -> Vec<String> {
             }
             if codex.transcriptions_api == Some(true) {
                 out.push("codex.transcriptionsApi: true".to_string());
+            }
+            if let Some(auth_file) = codex.auth_file.as_deref() {
+                out.push(format!("codex.authFile: {auth_file}"));
             }
             if let Some(ms) = codex.header_timeout_ms {
                 out.push(format!("codex.headerTimeoutMs: {ms}"));
@@ -931,6 +939,33 @@ pub fn codex_header_timeout_ms() -> u64 {
     CODEX_DEFAULT_HEADER_TIMEOUT_MS
 }
 
+/// `codex.authFile` value that selects the Codex CLI's own credential file.
+pub const CODEX_AUTH_FILE_CODEX_CLI: &str = "codex-cli";
+
+/// Credential file in the Codex CLI's `auth.json` format that ccp should use
+/// for Codex instead of its own store, or `None` for ccp's own store.
+pub fn codex_auth_file() -> Option<PathBuf> {
+    let deps = paths::DirResolverEnv::default();
+    let raw = match deps.env.get("CCP_CODEX_AUTH_FILE") {
+        Some(raw) => Some(raw.clone()),
+        None => read_file_config(&paths::config_dir())
+            .and_then(|file| file.codex)
+            .and_then(|codex| codex.auth_file),
+    };
+    resolve_codex_auth_file(raw.as_deref(), &deps)
+}
+
+fn resolve_codex_auth_file(raw: Option<&str>, deps: &paths::DirResolverEnv) -> Option<PathBuf> {
+    let raw = raw?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw == CODEX_AUTH_FILE_CODEX_CLI {
+        return Some(paths::codex_cli_auth_file(deps));
+    }
+    Some(PathBuf::from(raw))
+}
+
 // ---------------------------------------------------------------------------
 // Cursor config
 // ---------------------------------------------------------------------------
@@ -1028,6 +1063,7 @@ mod tests {
             EnvGuard::unset("CCP_CODEX_IMAGES_BASE_URL"),
             EnvGuard::unset("CCP_CODEX_TRANSCRIPTIONS_API"),
             EnvGuard::unset("CCP_CODEX_HEADER_TIMEOUT_MS"),
+            EnvGuard::unset("CCP_CODEX_AUTH_FILE"),
             EnvGuard::unset("CCP_AUTO_REVIEW_MODEL"),
         ];
         guards.push(EnvGuard::set("CCP_CONFIG_DIR", config.path()));
@@ -1426,5 +1462,65 @@ mod tests {
         assert!(codex_server_compaction());
         let _disabled_env = EnvGuard::set("CCP_CODEX_SERVER_COMPACTION", "false");
         assert!(!codex_server_compaction());
+    }
+
+    fn resolver_env(env: &[(&str, &str)]) -> paths::DirResolverEnv {
+        paths::DirResolverEnv {
+            platform: "linux".to_string(),
+            env: env
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            home: "/home/me".to_string(),
+        }
+    }
+
+    #[test]
+    fn resolve_codex_auth_file_values() {
+        let plain = resolver_env(&[]);
+        assert_eq!(resolve_codex_auth_file(None, &plain), None);
+        assert_eq!(resolve_codex_auth_file(Some(""), &plain), None);
+        assert_eq!(resolve_codex_auth_file(Some("  "), &plain), None);
+        assert_eq!(
+            resolve_codex_auth_file(Some("codex-cli"), &plain),
+            Some(PathBuf::from("/home/me/.codex/auth.json"))
+        );
+        assert_eq!(
+            resolve_codex_auth_file(
+                Some("codex-cli"),
+                &resolver_env(&[("CODEX_HOME", "/srv/codex")])
+            ),
+            Some(PathBuf::from("/srv/codex/auth.json"))
+        );
+        assert_eq!(
+            resolve_codex_auth_file(Some("/etc/codex/auth.json"), &plain),
+            Some(PathBuf::from("/etc/codex/auth.json"))
+        );
+    }
+
+    #[test]
+    fn codex_auth_file_env_overrides_config_and_empty_env_disables() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let config = tempfile::TempDir::new().unwrap();
+        let _env = isolated_env(&config);
+        assert_eq!(codex_auth_file(), None);
+        std::fs::write(
+            config.path().join("config.json"),
+            r#"{"codex":{"authFile":"/from/config/auth.json"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_auth_file(),
+            Some(PathBuf::from("/from/config/auth.json"))
+        );
+        {
+            let _auth_env = EnvGuard::set("CCP_CODEX_AUTH_FILE", "/from/env/auth.json");
+            assert_eq!(
+                codex_auth_file(),
+                Some(PathBuf::from("/from/env/auth.json"))
+            );
+        }
+        let _auth_env = EnvGuard::set("CCP_CODEX_AUTH_FILE", "");
+        assert_eq!(codex_auth_file(), None);
     }
 }

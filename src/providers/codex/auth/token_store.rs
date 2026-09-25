@@ -1,7 +1,13 @@
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use std::sync::Once;
 
-use crate::auth::{AuthStorage, KeychainFileAuthStore, SystemKeychain};
-use crate::paths;
+use super::codex_cli_store::CodexCliAuthStore;
+use crate::auth::{
+    AuthStorage, InMemoryAuthStore, Keychain, KeychainFileAuthStore, SystemKeychain,
+};
+use crate::logging::create_logger;
+use crate::{config, paths};
 
 pub const KEYCHAIN_SERVICE: &str = "claude-code-proxy.codex";
 pub const KEYCHAIN_ACCOUNT: &str = "auth";
@@ -20,8 +26,51 @@ pub struct StoredAuth {
     pub account_id: Option<String>,
 }
 
+/// Codex-specific hooks around a token refresh. The defaults are what ccp's
+/// own store needs; a store that another program also writes overrides them.
+pub trait CodexAuthStorage: AuthStorage<StoredAuth> {
+    /// File to hold an exclusive lock on from the pre-refresh reload until the
+    /// refreshed tokens are stored, so ccp processes sharing the store do not
+    /// refresh the same token concurrently.
+    fn refresh_lock_path(&self) -> Option<PathBuf> {
+        None
+    }
+
+    /// Store `next`, the result of refreshing `previous`, and return what is
+    /// stored afterwards. `id_token` is the refresh response's, if any.
+    fn save_refreshed(
+        &self,
+        previous: &StoredAuth,
+        next: StoredAuth,
+        id_token: Option<&str>,
+    ) -> Result<StoredAuth, anyhow::Error> {
+        let _ = (previous, id_token);
+        self.save(next.clone())?;
+        Ok(next)
+    }
+}
+
+impl CodexAuthStorage for InMemoryAuthStore<StoredAuth> {}
+
+impl<K: Keychain> CodexAuthStorage for KeychainFileAuthStore<StoredAuth, K> {}
+
 pub struct CodexTokenStore<S: AuthStorage<StoredAuth>> {
     store: S,
+}
+
+impl<S: CodexAuthStorage> CodexTokenStore<S> {
+    pub fn refresh_lock_path(&self) -> Option<PathBuf> {
+        self.store.refresh_lock_path()
+    }
+
+    pub fn save_refreshed(
+        &self,
+        previous: &StoredAuth,
+        next: StoredAuth,
+        id_token: Option<&str>,
+    ) -> Result<StoredAuth, anyhow::Error> {
+        self.store.save_refreshed(previous, next, id_token)
+    }
 }
 
 impl<S: AuthStorage<StoredAuth>> CodexTokenStore<S> {
@@ -46,20 +95,101 @@ impl<S: AuthStorage<StoredAuth>> CodexTokenStore<S> {
     }
 }
 
-pub type DefaultCodexAuthStore = KeychainFileAuthStore<StoredAuth, SystemKeychain>;
+/// Where Codex credentials live: ccp's own store, or the Codex CLI's
+/// `auth.json` when `codex.authFile` / `CCP_CODEX_AUTH_FILE` is set.
+pub enum CodexAuthStore {
+    Proxy(KeychainFileAuthStore<StoredAuth, SystemKeychain>),
+    CodexCli(CodexCliAuthStore),
+}
+
+pub type DefaultCodexAuthStore = CodexAuthStore;
+
+impl AuthStorage<StoredAuth> for CodexAuthStore {
+    fn load(&self) -> anyhow::Result<Option<StoredAuth>> {
+        match self {
+            Self::Proxy(store) => store.load(),
+            Self::CodexCli(store) => store.load(),
+        }
+    }
+
+    fn save(&self, value: StoredAuth) -> anyhow::Result<()> {
+        match self {
+            Self::Proxy(store) => store.save(value),
+            Self::CodexCli(store) => store.save(value),
+        }
+    }
+
+    fn clear(&self) -> anyhow::Result<()> {
+        match self {
+            Self::Proxy(store) => store.clear(),
+            Self::CodexCli(store) => store.clear(),
+        }
+    }
+
+    fn path(&self) -> String {
+        match self {
+            Self::Proxy(store) => store.path(),
+            Self::CodexCli(store) => store.path(),
+        }
+    }
+}
+
+impl CodexAuthStorage for CodexAuthStore {
+    fn refresh_lock_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Proxy(store) => store.refresh_lock_path(),
+            Self::CodexCli(store) => store.refresh_lock_path(),
+        }
+    }
+
+    fn save_refreshed(
+        &self,
+        previous: &StoredAuth,
+        next: StoredAuth,
+        id_token: Option<&str>,
+    ) -> Result<StoredAuth, anyhow::Error> {
+        match self {
+            Self::Proxy(store) => store.save_refreshed(previous, next, id_token),
+            Self::CodexCli(store) => store.save_refreshed(previous, next, id_token),
+        }
+    }
+}
 
 pub fn file_store() -> CodexTokenStore<DefaultCodexAuthStore> {
-    let primary = paths::provider_auth_file("codex");
-    let legacy = paths::provider_legacy_auth_file("codex");
-    let store = KeychainFileAuthStore::new(
-        primary.to_string_lossy().to_string(),
-        legacy.to_string_lossy().to_string(),
-        KEYCHAIN_SERVICE,
-        KEYCHAIN_ACCOUNT,
-        use_macos_keychain(),
-        SystemKeychain,
-    );
+    let store = match config::codex_auth_file() {
+        Some(path) => CodexAuthStore::CodexCli(CodexCliAuthStore::new(path)),
+        None => {
+            let primary = paths::provider_auth_file("codex");
+            let legacy = paths::provider_legacy_auth_file("codex");
+            CodexAuthStore::Proxy(KeychainFileAuthStore::new(
+                primary.to_string_lossy().to_string(),
+                legacy.to_string_lossy().to_string(),
+                KEYCHAIN_SERVICE,
+                KEYCHAIN_ACCOUNT,
+                use_macos_keychain(),
+                SystemKeychain,
+            ))
+        }
+    };
+    log_auth_source_once(&store);
     CodexTokenStore::new(store)
+}
+
+fn log_auth_source_once(store: &CodexAuthStore) {
+    static LOGGED: Once = Once::new();
+    LOGGED.call_once(|| {
+        let source = match store {
+            CodexAuthStore::Proxy(_) => "ccp",
+            CodexAuthStore::CodexCli(_) => "codex-cli-file",
+        };
+        create_logger("codex").info(
+            "codex_auth_source",
+            Some(serde_json::Map::from_iter([
+                ("source".to_string(), serde_json::json!(source)),
+                ("path".to_string(), serde_json::json!(store.path())),
+            ])),
+        );
+    });
 }
 
 fn use_macos_keychain() -> bool {

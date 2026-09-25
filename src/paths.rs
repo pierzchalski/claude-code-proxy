@@ -80,6 +80,15 @@ pub fn codex_auth_file(deps: &DirResolverEnv) -> PathBuf {
     resolve_config_dir(deps).join("codex").join("auth.json")
 }
 
+/// The Codex CLI's own credential file: `$CODEX_HOME/auth.json`, else
+/// `~/.codex/auth.json`.
+pub fn codex_cli_auth_file(deps: &DirResolverEnv) -> PathBuf {
+    match deps.env.get("CODEX_HOME").filter(|home| !home.is_empty()) {
+        Some(home) => Path::new(home).join("auth.json"),
+        None => join_with_sep(&deps.home, &[".codex", "auth.json"], false),
+    }
+}
+
 pub fn kimi_auth_file(deps: &DirResolverEnv) -> PathBuf {
     resolve_config_dir(deps).join("kimi").join("auth.json")
 }

@@ -37,6 +37,10 @@ pub struct TokenResponse {
 }
 
 fn parse_jwt_claims(token: &str) -> Option<IdTokenClaims> {
+    decode_jwt_payload(token)
+}
+
+fn decode_jwt_payload<T: serde::de::DeserializeOwned>(token: &str) -> Option<T> {
     let parts: Vec<&str> = token.split('.').collect();
     if parts.len() != 3 {
         return None;
@@ -61,6 +65,21 @@ fn extract_account_id_from_claims(claims: &IdTokenClaims) -> Option<String> {
         .or_else(|| claims.openai_auth.as_ref()?.chatgpt_account_id.clone())
         .or_else(|| claims.openai_chatgpt_account_id.clone())
         .or_else(|| claims.organizations.as_ref()?.first()?.id.clone().into())
+}
+
+/// ChatGPT account id from a JWT's claims (`id_token` or access token).
+pub fn account_id_from_jwt(token: &str) -> Option<String> {
+    extract_account_id_from_claims(&parse_jwt_claims(token)?)
+}
+
+/// A JWT's `exp` claim in milliseconds since the Unix epoch.
+pub fn jwt_expiry_ms(token: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct ExpClaim {
+        exp: Option<serde_json::Value>,
+    }
+    let seconds = decode_jwt_payload::<ExpClaim>(token)?.exp?.as_u64()?;
+    seconds.checked_mul(1000)
 }
 
 pub fn validate_token_response(tokens: &TokenResponse) -> anyhow::Result<()> {
