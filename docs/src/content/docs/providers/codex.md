@@ -26,7 +26,9 @@ By default the proxy owns its tokens and does not read native Codex CLI credenti
 
 ### Share the Codex CLI login
 
-Set `CCP_CODEX_AUTH_FILE=codex-cli`, or `"codex": { "authFile": "codex-cli" }` in `config.json`, to use the Codex CLI's login instead of a separate proxy login. The proxy then reads `$CODEX_HOME/auth.json`, or `~/.codex/auth.json` when `CODEX_HOME` is unset. Any other value is the path of a file in the same format. An empty `CCP_CODEX_AUTH_FILE` turns the setting off for that process.
+Set `CCP_CODEX_AUTH_FILE=codex-cli`, or `"codex": { "authFile": "codex-cli" }` in `config.json`, to use the Codex CLI's login instead of a separate proxy login. The proxy then reads `$CODEX_HOME/auth.json`, or `~/.codex/auth.json` when `CODEX_HOME` is unset. Any other value is the path of a file in the same format, taken literally: `~` is not expanded and a relative path resolves against the proxy's working directory. An empty `CCP_CODEX_AUTH_FILE` turns the setting off for that process.
+
+This needs the Codex CLI to keep its login in `auth.json`. When the Codex CLI stores credentials in the OS keyring instead, `auth.json` can be absent, and the proxy reports it as not found even though the Codex CLI is signed in.
 
 The Codex CLI and the proxy then share one login. Before refreshing an access token, the proxy re-reads the file and uses the Codex CLI's tokens if they changed. Otherwise it refreshes and writes the new tokens back into the same file: it replaces the file atomically, keeps every other field, and updates `last_refresh`. Proxy processes sharing the file serialize refreshes with a lock file next to it (`auth.json.ccp-lock`). The Codex CLI does not take that lock, so the proxy checks the file again before writing and keeps the Codex CLI's tokens if they changed during the refresh.
 
