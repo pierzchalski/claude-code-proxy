@@ -16,20 +16,63 @@ use super::token_store::{CodexAuthStorage, StoredAuth};
 use crate::auth::{AuthStorage, replace_file_atomically};
 use crate::logging::create_logger;
 
+type FileWriter = fn(&Path, &[u8]) -> anyhow::Result<()>;
+
 pub struct CodexCliAuthStore {
     path: PathBuf,
+    replace_atomically: FileWriter,
+    overwrite_in_place: FileWriter,
 }
 
 impl CodexCliAuthStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            replace_atomically: replace_file_atomically,
+            overwrite_in_place: overwrite_file_in_place,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_writers(
+        path: PathBuf,
+        replace_atomically: FileWriter,
+        overwrite_in_place: FileWriter,
+    ) -> Self {
+        Self {
+            path,
+            replace_atomically,
+            overwrite_in_place,
+        }
+    }
+
+    /// Persist refreshed tokens. By now the token endpoint has rotated the
+    /// refresh token, and the file's old one may stop working for both ccp
+    /// and the Codex CLI, so an atomic replace that fails (a rename onto a
+    /// single-file bind mount returns EBUSY) falls back to overwriting in
+    /// place, which is how the Codex CLI itself writes the file.
+    fn write_back(&self, target: &Path, contents: &[u8]) -> anyhow::Result<&'static str> {
+        let atomic_err = match (self.replace_atomically)(target, contents) {
+            Ok(()) => return Ok("atomic_replace"),
+            Err(err) => err,
+        };
+        match (self.overwrite_in_place)(target, contents) {
+            Ok(()) => Ok("in_place_after_atomic_replace_failed"),
+            Err(in_place_err) => Err(anyhow::anyhow!(
+                "refreshed Codex tokens could not be saved to {} (atomic replace: {atomic_err}; \
+                 in-place write: {in_place_err}); the refresh token in that file may stop \
+                 working for ccp and the Codex CLI, and a `codex login` may be needed",
+                self.path.display()
+            )),
+        }
     }
 
     fn read_value(&self) -> anyhow::Result<Value> {
         let raw = fs::read_to_string(&self.path).map_err(|err| {
             if err.kind() == io::ErrorKind::NotFound {
                 anyhow::anyhow!(
-                    "Codex CLI auth file {} not found; sign in with `codex login`",
+                    "Codex CLI auth file {} not found; ccp needs the Codex CLI to keep its \
+                     login in this file rather than the OS keyring. Sign in with `codex login`",
                     self.path.display()
                 )
             } else {
@@ -131,6 +174,17 @@ pub(crate) fn apply_refreshed_tokens(
     Ok(())
 }
 
+fn overwrite_file_in_place(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(())
+}
+
 fn now_rfc3339() -> anyhow::Result<String> {
     Ok(time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)?)
 }
@@ -209,10 +263,13 @@ impl CodexAuthStorage for CodexCliAuthStore {
         apply_refreshed_tokens(&mut value, &next, id_token, &now_rfc3339()?)?;
         // Replace the target of a symlinked auth.json, not the link.
         let target = fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
-        replace_file_atomically(&target, serde_json::to_string_pretty(&value)?.as_bytes())?;
+        let method = self.write_back(&target, serde_json::to_string_pretty(&value)?.as_bytes())?;
         log.info(
             "codex_auth_written_back",
-            Some(Map::from_iter([("path".to_string(), json!(path))])),
+            Some(Map::from_iter([
+                ("path".to_string(), json!(path)),
+                ("method".to_string(), json!(method)),
+            ])),
         );
         Ok(next)
     }
@@ -222,6 +279,19 @@ impl CodexAuthStorage for CodexCliAuthStore {
 pub(crate) mod test_support {
     use base64::Engine;
     use serde_json::Value;
+    use std::path::Path;
+
+    pub(crate) fn fail_atomic_replace(_: &Path, _: &[u8]) -> anyhow::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ResourceBusy,
+            "simulated rename onto a single-file bind mount",
+        )
+        .into())
+    }
+
+    pub(crate) fn fail_in_place_write(_: &Path, _: &[u8]) -> anyhow::Result<()> {
+        Err(std::io::Error::new(std::io::ErrorKind::StorageFull, "simulated full disk").into())
+    }
 
     /// An unsigned JWT carrying `claims`; ccp only decodes the payload.
     pub(crate) fn jwt(claims: Value) -> String {
@@ -480,5 +550,100 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(read(&target)["tokens"]["access_token"], "new-access");
+    }
+
+    fn refreshed() -> StoredAuth {
+        StoredAuth {
+            access: "new-access".into(),
+            refresh: "new-refresh".into(),
+            expires: 42,
+            account_id: Some("acct_1".into()),
+        }
+    }
+
+    #[test]
+    fn save_refreshed_falls_back_to_in_place_write_when_atomic_replace_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write(&dir, &cli_file("old-access", "old-refresh"));
+        let store = CodexCliAuthStore::with_writers(
+            path.clone(),
+            test_support::fail_atomic_replace,
+            overwrite_file_in_place,
+        );
+        let previous = store.load().unwrap().unwrap();
+
+        let stored = store
+            .save_refreshed(&previous, refreshed(), Some("new-id"))
+            .unwrap();
+        assert_eq!(stored, refreshed());
+        let on_disk = read(&path);
+        assert_eq!(on_disk["tokens"]["access_token"], "new-access");
+        assert_eq!(on_disk["tokens"]["refresh_token"], "new-refresh");
+        assert_eq!(on_disk["tokens"]["id_token"], "new-id");
+        assert_eq!(on_disk["agent_identity"], "kept-unknown-to-ccp");
+        assert_eq!(
+            on_disk["tokens"]["future_token_field"],
+            json!({"kept": true})
+        );
+    }
+
+    #[test]
+    fn save_refreshed_reports_unsaved_tokens_when_both_writes_fail() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write(&dir, &cli_file("old-access", "old-refresh"));
+        let before = fs::read(&path).unwrap();
+        let store = CodexCliAuthStore::with_writers(
+            path.clone(),
+            test_support::fail_atomic_replace,
+            test_support::fail_in_place_write,
+        );
+        let previous = store.load().unwrap().unwrap();
+
+        let err = store
+            .save_refreshed(&previous, refreshed(), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("could not be saved"), "{err}");
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(
+            err.contains("simulated rename onto a single-file bind mount"),
+            "{err}"
+        );
+        assert!(err.contains("simulated full disk"), "{err}");
+        assert!(err.contains("codex login"), "{err}");
+        assert!(!err.contains("new-refresh"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn save_refreshed_skips_write_back_when_file_is_mid_write() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write(&dir, &cli_file("old-access", "old-refresh"));
+        let store = CodexCliAuthStore::new(path.clone());
+        let previous = store.load().unwrap().unwrap();
+        // The Codex CLI truncates and rewrites in place; a read can land
+        // between the truncate and the write.
+        fs::write(&path, "{\"tokens\": {").unwrap();
+
+        let stored = store
+            .save_refreshed(&previous, refreshed(), Some("new-id"))
+            .unwrap();
+        assert_eq!(stored, refreshed());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"tokens\": {");
+    }
+
+    #[test]
+    fn save_refreshed_skips_write_back_when_tokens_are_gone() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write(&dir, &cli_file("old-access", "old-refresh"));
+        let store = CodexCliAuthStore::new(path.clone());
+        let previous = store.load().unwrap().unwrap();
+        // Switched to API-key auth while the refresh was in flight.
+        write(&dir, &json!({"OPENAI_API_KEY": "sk-test"}));
+        let before = fs::read(&path).unwrap();
+
+        let stored = store.save_refreshed(&previous, refreshed(), None).unwrap();
+        assert_eq!(stored, refreshed());
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 }

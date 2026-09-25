@@ -85,7 +85,10 @@ impl<S: CodexAuthStorage> CodexAuthManager<S> {
         rejected_access: Option<&str>,
     ) -> Result<StoredAuth, anyhow::Error> {
         let _refresh_guard = self.refresh_lock.lock().await;
-        let _file_guard = match self.store.refresh_lock_path() {
+        // A store with a refresh lock file is shared with other programs.
+        let lock_path = self.store.refresh_lock_path();
+        let shared_store = lock_path.is_some();
+        let _file_guard = match lock_path {
             Some(path) => Some(lock_file_exclusive(path).await?),
             None => None,
         };
@@ -100,6 +103,9 @@ impl<S: CodexAuthStorage> CodexAuthManager<S> {
         if (!force && current.expires > Self::now_ms() + REFRESH_MARGIN_MS)
             || rejected_access.is_some_and(|access| current.access != access)
         {
+            if !shared_store {
+                return Ok(current);
+            }
             create_logger("codex").info(
                 "codex_auth_adopted",
                 Some(serde_json::Map::from_iter([
@@ -221,7 +227,7 @@ async fn lock_file_exclusive(path: std::path::PathBuf) -> Result<std::fs::File, 
 #[cfg(test)]
 mod tests {
     use super::super::codex_cli_store::CodexCliAuthStore;
-    use super::super::codex_cli_store::test_support::jwt;
+    use super::super::codex_cli_store::test_support::{self, jwt};
     use super::*;
     use crate::auth::{AuthStorage, InMemoryAuthStore};
     use serde_json::{Value, json};
@@ -608,6 +614,52 @@ mod tests {
         let auth = waiting.await.unwrap().unwrap();
         assert_eq!(auth.access, "other-rotated");
         assert_eq!(auth.refresh, "other-rotated-refresh");
+    }
+
+    #[tokio::test]
+    async fn codex_cli_token_without_exp_is_used_without_refresh() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        write_json(&path, &codex_cli_file("opaque-access", "refresh"));
+        let before = std::fs::read(&path).unwrap();
+        let manager = CodexAuthManager::new_with_token_endpoint(
+            CodexTokenStore::new(CodexCliAuthStore::new(path.clone())),
+            "http://127.0.0.1:1/should-not-be-called".into(),
+        );
+
+        let auth = manager.get_auth().await.unwrap();
+        assert_eq!(auth.access, "opaque-access");
+        assert_eq!(auth.refresh, "refresh");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn codex_cli_unsaved_refresh_is_reported() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        write_json(&path, &codex_cli_file(&jwt(json!({"exp": 1})), "stale"));
+        let before = std::fs::read(&path).unwrap();
+        let body = json!({
+            "access_token": "rotated",
+            "refresh_token": "rotated-refresh",
+            "expires_in": 3600
+        })
+        .to_string();
+        let (url, server) = serve_once("HTTP/1.1 200 OK", body, |_| {});
+        let manager = CodexAuthManager::new_with_token_endpoint(
+            CodexTokenStore::new(CodexCliAuthStore::with_writers(
+                path.clone(),
+                test_support::fail_atomic_replace,
+                test_support::fail_in_place_write,
+            )),
+            url,
+        );
+
+        let err = manager.get_auth().await.unwrap_err().to_string();
+        server.join().unwrap();
+        assert!(err.contains("could not be saved"), "{err}");
+        assert!(err.contains("codex login"), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[tokio::test]
