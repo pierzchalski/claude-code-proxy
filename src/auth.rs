@@ -334,8 +334,16 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("invalid auth path"))?;
     fs::create_dir_all(dir)?;
     set_mode(dir, 0o700);
+    replace_file_atomically(
+        std::path::Path::new(path),
+        to_string_pretty(value)?.as_bytes(),
+    )
+}
 
-    let tmp = format!("{path}.tmp-{}", uuid::Uuid::new_v4());
+/// Replace `path` with `contents` via a mode-0600 temp file in the same
+/// directory and a rename. Leaves the directory itself alone.
+pub fn replace_file_atomically(path: &std::path::Path, contents: &[u8]) -> Result<()> {
+    let tmp = format!("{}.tmp-{}", path.display(), uuid::Uuid::new_v4());
     #[cfg(unix)]
     let mut out = {
         use std::os::unix::fs::OpenOptionsExt;
@@ -350,13 +358,15 @@ pub fn write_atomically<T: Serialize>(path: &str, value: &T) -> Result<()> {
         .write(true)
         .create_new(true)
         .open(&tmp)?;
-    out.write_all(to_string_pretty(value)?.as_bytes())?;
-    out.sync_all()?;
+    if let Err(err) = out.write_all(contents).and_then(|()| out.sync_all()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err.into());
+    }
     if let Err(err) = fs::rename(&tmp, path) {
         let _ = fs::remove_file(&tmp);
         return Err(err.into());
     }
-    set_mode(std::path::Path::new(path), 0o600);
+    set_mode(path, 0o600);
     Ok(())
 }
 
