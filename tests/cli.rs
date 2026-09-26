@@ -12,6 +12,31 @@ use std::{
 };
 use tempfile::TempDir;
 
+/// Points a child's config, state and Codex CLI home at `dir`, so commands that
+/// load the Codex model catalog neither read the host's
+/// `~/.codex/models_cache.json` nor write the host's `proxy.log`.
+trait IsolateEnv {
+    fn isolate_env(&mut self, dir: &std::path::Path) -> &mut Self;
+}
+
+impl IsolateEnv for Command {
+    fn isolate_env(&mut self, dir: &std::path::Path) -> &mut Self {
+        self.env("CCP_CONFIG_DIR", dir.join("config"))
+            .env("XDG_STATE_HOME", dir.join("state"))
+            .env("CODEX_HOME", dir.join("codex-home"))
+            .env_remove("CCP_CODEX_AUTH_FILE")
+    }
+}
+
+impl IsolateEnv for std::process::Command {
+    fn isolate_env(&mut self, dir: &std::path::Path) -> &mut Self {
+        self.env("CCP_CONFIG_DIR", dir.join("config"))
+            .env("XDG_STATE_HOME", dir.join("state"))
+            .env("CODEX_HOME", dir.join("codex-home"))
+            .env_remove("CCP_CODEX_AUTH_FILE")
+    }
+}
+
 #[test]
 fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Error>> {
     let expected = format!("claude-code-proxy {}", env!("CARGO_PKG_VERSION"));
@@ -28,7 +53,9 @@ fn version_aliases_print_expected_version() -> Result<(), Box<dyn std::error::Er
 
 #[test]
 fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    cmd.isolate_env(temp.path());
     cmd.arg("models");
     let out = String::from_utf8(cmd.output()?.stdout)?;
     assert!(out.contains("codex:"));
@@ -37,6 +64,7 @@ fn models_prints_all_providers() -> Result<(), Box<dyn std::error::Error>> {
     assert!(out.contains("cursor:"));
 
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    cmd.isolate_env(temp.path());
     cmd.args(["models", "--full"]);
     cmd.output()?;
     Ok(())
@@ -99,7 +127,9 @@ fn provider_logout_without_auth_is_success() -> Result<(), Box<dyn std::error::E
 
 #[test]
 fn models_output_is_stable_order() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = TempDir::new()?;
     let mut cmd = Command::cargo_bin("claude-code-proxy")?;
+    cmd.isolate_env(temp.path());
     cmd.args(["models", "--full"]);
     let output = cmd.output()?;
     let out = String::from_utf8(output.stdout)?;
@@ -195,9 +225,11 @@ fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std:
         auth_dir.join("auth.json"),
         r#"{"access":"test","refresh":"test","expires":4102444800000,"scope":"openid","userId":"test"}"#,
     )?;
+    let isolated = TempDir::new()?;
     let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-code-proxy"))
         .args(["serve", "--no-monitor", "--port", &port.to_string()])
+        .isolate_env(isolated.path())
         .env("CCP_CONFIG_DIR", config.path())
         .env("CCP_KIMI_BASE_URL", upstream_url)
         .env("NO_PROXY", "127.0.0.1,localhost")
