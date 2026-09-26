@@ -109,6 +109,7 @@ Proxy URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 | `CCP_CODEX_SERVICE_TIER` | `codex.serviceTier` | unset | Forces `fast` or `priority`, or `flex`. Fast is sent as `priority`. |
 | `CCP_CODEX_AUTH_FILE` | `codex.authFile` | unset | Uses a Codex CLI `auth.json` instead of the proxy's own Codex login. `codex-cli` selects `$CODEX_HOME/auth.json` or `~/.codex/auth.json`; any other value is a path. See [Codex](/providers/codex/#share-the-codex-cli-login). |
 | `CCP_CODEX_BASE_URL` | `codex.baseUrl` | ChatGPT Codex Responses URL | Changes the Codex endpoint. |
+| `CCP_CODEX_CLIENT_VERSION` | none | Codex CLI cache's version, else built in | Sets the `client_version` sent when fetching the Codex model catalog. |
 | `CCP_CODEX_TRANSPORT` | `codex.transport` | `websocket` | Selects `websocket`, `http`, or `auto`. |
 | `CCP_CODEX_HEADER_TIMEOUT_MS` | `codex.headerTimeoutMs` | `300000` | Sets how long an HTTP-transport request waits for the Codex response headers. Values below `1000` are ignored. |
 | `CCP_CODEX_PREVIOUS_RESPONSE_ID` | `codex.previousResponseId` | `false` | Enables append-only WebSocket continuation for `1`, `true`, or `yes`. |

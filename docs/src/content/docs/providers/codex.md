@@ -38,9 +38,31 @@ With the setting on, `codex auth status` names the file in use, and `codex auth 
 
 Use `claude-code-proxy models` as the current catalog. Model access depends on your ChatGPT account. A model rejected by the subscription produces the upstream error verbatim.
 
+### Model catalog
+
+The Codex model list is not built into the proxy. It comes from a catalog, read from the first of these that exists:
+
+1. The proxy's own catalog, `<state-root>/codex/models_catalog.json`. The proxy fetches it from the Codex backend's `/models` endpoint, the one the Codex CLI uses, with your Codex login. It sends the stored ETag as `If-None-Match` and keeps the stored models on `304 Not Modified`.
+2. The Codex CLI's model cache, `$CODEX_HOME/models_cache.json` or `~/.codex/models_cache.json`. The proxy only reads it, as a starting point until its first successful fetch.
+3. A static list compiled into the proxy, used only when neither file exists, such as a first start with no network and no Codex CLI.
+
+For each model the catalog decides:
+
+- whether requests are accepted: `supported_in_api`. Hidden models are accepted when named explicitly.
+- whether it is listed by `claude-code-proxy models` and `GET /v1/models`: `visibility` is `list`. Each listed model is also listed with a `-fast` suffix.
+- which Responses lane it uses: `use_responses_lite`.
+
+The proxy refreshes the catalog when the server starts (in the background; requests are served meanwhile), every three hours, and when a request names a model that no provider accepts. That last refresh runs at most once a minute; concurrent requests for the same unknown model wait for one fetch. A failed refresh keeps the previous catalog and logs one `codex model catalog refresh failed` line to `proxy.log`. A successful one logs `codex model catalog refreshed` with the added and removed slugs, and a model that became usable through a request-triggered refresh logs `model accepted from catalog`.
+
+`claude-code-proxy codex models` prints the catalog in use: its source, file, `fetched_at`, ETag, the `client_version` recorded with it, and for each model its lane, whether it is listed, whether it is accepted, and its context window. `claude-code-proxy codex models --refresh` fetches first and exits with status 1 if the fetch fails.
+
+The request carries `client_version`: `CCP_CODEX_CLIENT_VERSION` when set, otherwise the version recorded in the Codex CLI's model cache, otherwise a version compiled into the proxy.
+
+The Claude-style aliases below and the web-search upgrade from luna models to their sol sibling (luna is not available on the full Responses lane that hosted web search needs) are still built in.
+
 Claude-style aliases map to Codex models: `haiku` and `claude-haiku-*` to `gpt-6-luna`, `sonnet` and `claude-sonnet-*` to `gpt-5.6-terra`, and `opus`, `fable`, `claude-opus-*` (including `claude-opus-5-5`), and `claude-fable-*` to `gpt-6-sol`.
 
-Append `-fast` to any registered Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service. `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence.
+Append `-fast` to any accepted Codex model to request `service_tier: "priority"`. For example, `gpt-6-sol-fast` selects `gpt-6-sol` with fast service. `CCP_CODEX_SERVICE_TIER` or `codex.serviceTier` takes precedence.
 
 ## Reasoning
 

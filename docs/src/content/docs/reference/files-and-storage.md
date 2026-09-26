@@ -47,6 +47,10 @@ The proxy owns these credentials independently of native Codex, Grok, and Cursor
 
 Kimi stores a persistent UUID at `<configuration-root>/kimi/device_id` for file-backed setups. It is bound into the Kimi token and must remain paired with that login.
 
+## Codex model catalog
+
+`codex/models_catalog.json` under the state root holds the Codex model catalog the proxy last fetched, with its `fetched_at`, ETag, and `client_version`. Deleting it makes the proxy fall back to the Codex CLI's `models_cache.json`, which it never writes. See [Codex](/providers/codex/#model-catalog).
+
 ## Structured log
 
 `proxy.log` lives under the state root. It uses JSON Lines and rotates at 20 MiB. Known credential keys, including authorization, access tokens, refresh tokens, ID tokens, and account headers, are redacted before writing.

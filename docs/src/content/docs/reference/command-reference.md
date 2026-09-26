@@ -86,6 +86,15 @@ Logout removes the local proxy-owned credential. It does not call the provider t
 
 When Codex shares the Codex CLI's login (`codex.authFile`), `codex auth login`, `device`, and `logout` refuse to run, and `codex auth status` names the Codex CLI file in use.
 
+## Codex model catalog
+
+```sh
+claude-code-proxy codex models
+claude-code-proxy codex models --refresh
+```
+
+Prints the Codex model catalog in use: its source (proxy catalog, Codex CLI cache, or static fallback), file, `fetched_at`, ETag, `client_version`, and each model's lane, listing, acceptance, and context window. `--refresh` fetches the catalog from the Codex backend first and exits with status 1 if that fails. See [Codex](/providers/codex/#model-catalog).
+
 ## Development commands
 
 From a source checkout:
