@@ -355,7 +355,7 @@ fn run_codex_models(refresh: bool) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        match runtime.block_on(store.refresh(catalog::RefreshReason::Manual)) {
+        match runtime.block_on(store.refresh(catalog::RefreshTrigger::Manual)) {
             Ok(catalog::RefreshOutcome::Updated { models }) => {
                 println!("refresh: fetched {models} models");
             }

@@ -51,7 +51,7 @@ use uuid::Uuid;
 
 const CLAUDE_AUTO_REVIEW_SYSTEM_PREFIX: &str =
     "You are a security monitor for autonomous AI coding agents.";
-const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-6-luna";
+pub(crate) const CODEX_AUTO_REVIEW_MODEL: &str = "gpt-6-luna";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AutoReviewRoute {

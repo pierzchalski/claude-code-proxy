@@ -129,7 +129,7 @@ pub fn uses_responses_lite(model: &str) -> bool {
 /// catalog does not say which lite-lane models also exist on the full lane
 /// (its `supports_search_tool` is about tool search, not hosted web search),
 /// so this stays a static table.
-const LITE_ONLY_WEB_SEARCH_UPGRADES: &[(&str, &str)] =
+pub const LITE_ONLY_WEB_SEARCH_UPGRADES: &[(&str, &str)] =
     &[("gpt-5.6-luna", "gpt-5.6-sol"), ("gpt-6-luna", "gpt-6-sol")];
 
 pub fn full_lane_web_search_model(model: &str) -> &str {

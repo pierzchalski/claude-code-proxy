@@ -300,14 +300,44 @@ pub enum FetchOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchError {
+    /// `auth_unavailable`, `unauthorized`, `http_status`, `transport`,
+    /// `invalid_body`, `no_usable_models`, or `not_configured`.
+    pub reason: &'static str,
+    pub detail: String,
+}
+
+impl FetchError {
+    pub fn new(reason: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.reason, self.detail)
+    }
+}
+
 #[async_trait]
 pub trait CatalogFetcher: Send + Sync {
-    async fn fetch(&self, etag: Option<&str>, client_version: &str)
-    -> Result<FetchOutcome, String>;
+    async fn fetch(
+        &self,
+        etag: Option<&str>,
+        client_version: &str,
+    ) -> Result<FetchOutcome, FetchError>;
 }
 
 /// `GET <codex api root>/models?client_version=<v>` with the Codex bearer
-/// token, as the Codex CLI does.
+/// token, as the Codex CLI does. Uses the stored access token only while it
+/// is unexpired and never refreshes the login: with a shared Codex CLI
+/// `auth.json`, every refresh rotates the CLI's refresh token, and the catalog
+/// runs on timers when nothing else is using the proxy. Requests refresh the
+/// token on their own path.
 pub struct HttpCatalogFetcher {
     client: reqwest::Client,
     url: String,
@@ -332,7 +362,7 @@ impl HttpCatalogFetcher {
         auth: &StoredAuth,
         etag: Option<&str>,
         client_version: &str,
-    ) -> Result<reqwest::Response, String> {
+    ) -> Result<reqwest::Response, FetchError> {
         let mut request = self
             .client
             .get(&self.url)
@@ -357,7 +387,26 @@ impl HttpCatalogFetcher {
             .timeout(FETCH_TIMEOUT)
             .send()
             .await
-            .map_err(|error| format!("transport error: {error}"))
+            .map_err(|error| FetchError::new("transport", error.to_string()))
+    }
+
+    fn unexpired_auth(&self) -> Result<StoredAuth, FetchError> {
+        let auth = self
+            .auth_manager
+            .stored_auth()
+            .map_err(|error| FetchError::new("auth_unavailable", error.to_string()))?
+            .ok_or_else(|| FetchError::new("auth_unavailable", "no stored Codex login"))?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        if auth.expires <= now_ms {
+            return Err(FetchError::new(
+                "auth_unavailable",
+                "stored access token has expired; not refreshing it for the catalog",
+            ));
+        }
+        Ok(auth)
     }
 }
 
@@ -367,27 +416,24 @@ impl CatalogFetcher for HttpCatalogFetcher {
         &self,
         etag: Option<&str>,
         client_version: &str,
-    ) -> Result<FetchOutcome, String> {
-        let mut auth = self
-            .auth_manager
-            .get_auth()
-            .await
-            .map_err(|error| format!("auth: {error}"))?;
-        let mut response = self.send(&auth, etag, client_version).await?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            auth = self
-                .auth_manager
-                .force_refresh(&auth.access)
-                .await
-                .map_err(|error| format!("auth refresh: {error}"))?;
-            response = self.send(&auth, etag, client_version).await?;
-        }
+    ) -> Result<FetchOutcome, FetchError> {
+        let auth = self.unexpired_auth()?;
+        let response = self.send(&auth, etag, client_version).await?;
         let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(FetchError::new(
+                "unauthorized",
+                "HTTP 401; not refreshing the login for the catalog",
+            ));
+        }
         if status == reqwest::StatusCode::NOT_MODIFIED {
             return Ok(FetchOutcome::NotModified);
         }
         if !status.is_success() {
-            return Err(format!("HTTP {}", status.as_u16()));
+            return Err(FetchError::new(
+                "http_status",
+                format!("HTTP {}", status.as_u16()),
+            ));
         }
         let new_etag = response
             .headers()
@@ -397,12 +443,12 @@ impl CatalogFetcher for HttpCatalogFetcher {
         let body: Value = response
             .json()
             .await
-            .map_err(|error| format!("invalid JSON body: {error}"))?;
+            .map_err(|error| FetchError::new("invalid_body", error.to_string()))?;
         let models = body
             .get("models")
             .and_then(Value::as_array)
             .cloned()
-            .ok_or_else(|| "response has no models array".to_string())?;
+            .ok_or_else(|| FetchError::new("invalid_body", "response has no models array"))?;
         Ok(FetchOutcome::Updated {
             etag: new_etag,
             models,
@@ -424,20 +470,20 @@ pub fn models_endpoint(base_url: &str) -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefreshReason {
+pub enum RefreshTrigger {
     Startup,
     Periodic,
     UnknownModel,
     Manual,
 }
 
-impl RefreshReason {
+impl RefreshTrigger {
     fn as_str(self) -> &'static str {
         match self {
-            RefreshReason::Startup => "startup",
-            RefreshReason::Periodic => "periodic",
-            RefreshReason::UnknownModel => "unknown_model",
-            RefreshReason::Manual => "manual",
+            RefreshTrigger::Startup => "startup",
+            RefreshTrigger::Periodic => "periodic",
+            RefreshTrigger::UnknownModel => "unknown_model",
+            RefreshTrigger::Manual => "manual",
         }
     }
 }
@@ -551,33 +597,41 @@ impl CatalogStore {
             .unwrap_or_else(|| DEFAULT_CLIENT_VERSION.to_string())
     }
 
-    pub async fn refresh(&self, reason: RefreshReason) -> Result<RefreshOutcome, String> {
+    pub async fn refresh(&self, trigger: RefreshTrigger) -> Result<RefreshOutcome, FetchError> {
         let _guard = self.refresh_lock.lock().await;
-        self.refresh_locked(reason).await
+        self.refresh_locked(trigger).await
     }
 
-    async fn refresh_locked(&self, reason: RefreshReason) -> Result<RefreshOutcome, String> {
+    async fn refresh_locked(&self, trigger: RefreshTrigger) -> Result<RefreshOutcome, FetchError> {
         let log = create_logger("codex");
         let Some(fetcher) = self.fetcher.as_ref() else {
-            return Err("model catalog fetching is not configured".to_string());
+            return Err(FetchError::new(
+                "not_configured",
+                "model catalog fetching is not configured",
+            ));
         };
         let current = self.snapshot();
-        let etag = (current.source == CatalogSource::Proxy)
-            .then(|| current.etag.clone())
-            .flatten();
         let client_version = self.client_version();
+        // The ETag describes the catalog fetched with the stored client_version;
+        // after a Codex CLI upgrade, fetch unconditionally so version-gated
+        // models can appear even if the backend's ETag ignores the version.
+        let etag = (current.source == CatalogSource::Proxy
+            && current.client_version.as_deref() == Some(client_version.as_str()))
+        .then(|| current.etag.clone())
+        .flatten();
         let result = fetcher.fetch(etag.as_deref(), &client_version).await;
         let now = now_rfc3339();
         match result {
             Ok(FetchOutcome::NotModified) => {
                 let mut next = (*current).clone();
                 next.fetched_at = Some(now);
+                next.client_version = Some(client_version);
                 self.persist(&next, &log);
                 self.replace_snapshot(next);
                 log.info(
                     "codex model catalog not modified",
                     Some(fields([
-                        ("reason", json!(reason.as_str())),
+                        ("trigger", json!(trigger.as_str())),
                         ("etag", json!(etag)),
                     ])),
                 );
@@ -589,8 +643,9 @@ impl CatalogStore {
             }) => {
                 let (parsed, raw_models) = parse_models(&models);
                 if parsed.is_empty() {
-                    let error = "response contained no usable models".to_string();
-                    log_refresh_failure(&log, reason, &error, &current);
+                    let error =
+                        FetchError::new("no_usable_models", "response contained no usable models");
+                    log_refresh_failure(&log, trigger, &error, &current);
                     return Err(error);
                 }
                 let added: Vec<&str> = parsed
@@ -607,7 +662,7 @@ impl CatalogStore {
                 log.info(
                     "codex model catalog refreshed",
                     Some(fields([
-                        ("reason", json!(reason.as_str())),
+                        ("trigger", json!(trigger.as_str())),
                         ("models", json!(parsed.len())),
                         ("added", json!(added)),
                         ("removed", json!(removed)),
@@ -626,12 +681,19 @@ impl CatalogStore {
                     models: parsed,
                     raw_models,
                 };
+                let missing = missing_hardcoded_targets(&next);
+                if !missing.is_empty() {
+                    log.warn(
+                        "codex model catalog lacks hardcoded targets",
+                        Some(fields([("missing", json!(missing))])),
+                    );
+                }
                 self.persist(&next, &log);
                 self.replace_snapshot(next);
                 Ok(RefreshOutcome::Updated { models: count })
             }
             Err(error) => {
-                log_refresh_failure(&log, reason, &error, &current);
+                log_refresh_failure(&log, trigger, &error, &current);
                 Err(error)
             }
         }
@@ -686,7 +748,7 @@ impl CatalogStore {
             }
             *last = Some(Instant::now());
         }
-        let _ = self.refresh_locked(RefreshReason::UnknownModel).await;
+        let _ = self.refresh_locked(RefreshTrigger::UnknownModel).await;
         let snapshot = self.snapshot();
         let accepted = snapshot.accepts(slug);
         if accepted {
@@ -709,26 +771,49 @@ impl CatalogStore {
         }
         let store = Arc::clone(self);
         tokio::spawn(async move {
-            let _ = store.refresh(RefreshReason::Startup).await;
+            let _ = store.refresh(RefreshTrigger::Startup).await;
             loop {
                 tokio::time::sleep(PERIODIC_REFRESH_INTERVAL).await;
-                let _ = store.refresh(RefreshReason::Periodic).await;
+                let _ = store.refresh(RefreshTrigger::Periodic).await;
             }
         });
     }
 }
 
+/// Slugs the proxy names in code (alias targets, the auto-review model, the
+/// web-search upgrade targets) that `snapshot` does not accept.
+pub fn missing_hardcoded_targets(snapshot: &CatalogSnapshot) -> Vec<&'static str> {
+    use crate::providers::codex::translate::model_allowlist::{
+        LITE_ONLY_WEB_SEARCH_UPGRADES, MODEL_ALIASES,
+    };
+    let mut targets: Vec<&'static str> = MODEL_ALIASES
+        .iter()
+        .map(|(_, target)| *target)
+        .chain(std::iter::once(crate::server::CODEX_AUTO_REVIEW_MODEL))
+        .chain(
+            LITE_ONLY_WEB_SEARCH_UPGRADES
+                .iter()
+                .map(|(_, full_lane)| *full_lane),
+        )
+        .filter(|target| !snapshot.is_allowed(target))
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
 fn log_refresh_failure(
     log: &crate::logging::Logger,
-    reason: RefreshReason,
-    error: &str,
+    trigger: RefreshTrigger,
+    error: &FetchError,
     kept: &CatalogSnapshot,
 ) {
     log.warn(
         "codex model catalog refresh failed",
         Some(fields([
-            ("reason", json!(reason.as_str())),
-            ("error", json!(error)),
+            ("trigger", json!(trigger.as_str())),
+            ("reason", json!(error.reason)),
+            ("error", json!(error.detail)),
             ("keptSource", json!(kept.source.label())),
             ("keptModels", json!(kept.models.len())),
         ])),
@@ -932,11 +1017,31 @@ mod tests {
             std::fs::write(self.cli_path(), CLI_CACHE_FIXTURE).unwrap();
         }
 
+        fn write_proxy_catalog(&self, fetched_at: &str, etag: &str, client_version: &str) {
+            let models: Value = serde_json::from_str(BACKEND_BODY).unwrap();
+            let file = json!({
+                "fetched_at": fetched_at,
+                "etag": etag,
+                "client_version": client_version,
+                "models": models["models"],
+            });
+            std::fs::create_dir_all(self.proxy_path().parent().unwrap()).unwrap();
+            std::fs::write(self.proxy_path(), file.to_string()).unwrap();
+        }
+
         fn store(&self, fetcher: Option<Arc<dyn CatalogFetcher>>) -> Arc<CatalogStore> {
+            self.store_with_version(fetcher, None)
+        }
+
+        fn store_with_version(
+            &self,
+            fetcher: Option<Arc<dyn CatalogFetcher>>,
+            client_version_override: Option<&str>,
+        ) -> Arc<CatalogStore> {
             Arc::new(CatalogStore::new(CatalogStoreConfig {
                 proxy_path: Some(self.proxy_path()),
                 codex_cli_cache_path: Some(self.cli_path()),
-                client_version_override: None,
+                client_version_override: client_version_override.map(str::to_string),
                 fetcher,
                 miss_refresh_interval: MISS_REFRESH_INTERVAL,
             }))
@@ -967,11 +1072,18 @@ mod tests {
         }
 
         fn fetcher(&self) -> Arc<dyn CatalogFetcher> {
-            let auth_manager = CodexAuthManager::new(file_store());
+            self.fetcher_with(u64::MAX / 2, "http://127.0.0.1:9/oauth/token".to_string())
+        }
+
+        /// A fetcher whose stored token expires at `expires` (ms) and whose
+        /// OAuth token endpoint is `token_endpoint`.
+        fn fetcher_with(&self, expires: u64, token_endpoint: String) -> Arc<dyn CatalogFetcher> {
+            let auth_manager =
+                CodexAuthManager::new_with_token_endpoint(file_store(), token_endpoint);
             auth_manager.set_test_auth(StoredAuth {
                 access: "test-access".to_string(),
                 refresh: "test-refresh".to_string(),
-                expires: u64::MAX / 2,
+                expires,
                 account_id: Some("acct-test".to_string()),
             });
             Arc::new(HttpCatalogFetcher::new(
@@ -1136,7 +1248,6 @@ mod tests {
         let written = std::fs::read_to_string(fixture.proxy_path()).unwrap();
         assert!(written.contains("gpt-8-test"));
         assert!(written.contains("W/\\\"v2\\\""));
-        assert!(!written.contains("identity"));
         assert_eq!(std::fs::read(fixture.cli_path()).unwrap(), cli_before);
         assert_eq!(current().source, CatalogSource::Proxy);
     }
@@ -1179,7 +1290,7 @@ mod tests {
             let backend = Backend::start(move |_| body.clone());
             let store = fixture.store(Some(backend.fetcher()));
             let before = store.snapshot();
-            assert!(store.refresh(RefreshReason::Manual).await.is_err());
+            assert!(store.refresh(RefreshTrigger::Manual).await.is_err());
             let after = store.snapshot();
             assert_eq!(after.source, CatalogSource::CodexCliCache);
             assert_eq!(after.models, before.models);
@@ -1190,6 +1301,7 @@ mod tests {
     #[tokio::test]
     async fn etag_not_modified_keeps_models_and_updates_fetched_at() {
         let fixture = Fixture::new();
+        fixture.write_proxy_catalog("2026-01-01T00:00:00Z", "W/\"v1\"", "0.150.0");
         let backend = Backend::start(|request| {
             if request
                 .to_ascii_lowercase()
@@ -1198,33 +1310,126 @@ mod tests {
                 "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     .to_string()
             } else {
-                with_etag("200 OK", "W/\"v1\"", BACKEND_BODY)
+                json_response(500, "{}")
             }
         });
-        let store = fixture.store(Some(backend.fetcher()));
+        let store = fixture.store_with_version(Some(backend.fetcher()), Some("0.150.0"));
+        let before = store.snapshot();
 
         assert_eq!(
-            store.refresh(RefreshReason::Manual).await,
-            Ok(RefreshOutcome::Updated { models: 3 })
-        );
-        let first = store.snapshot();
-        assert_eq!(first.etag.as_deref(), Some("W/\"v1\""));
-
-        assert_eq!(
-            store.refresh(RefreshReason::Manual).await,
+            store.refresh(RefreshTrigger::Manual).await,
             Ok(RefreshOutcome::NotModified)
         );
-        assert_eq!(backend.hits(), 2);
-        let second = store.snapshot();
-        assert_eq!(second.models, first.models);
-        assert_eq!(second.etag, first.etag);
-        assert!(second.fetched_at.is_some());
+        assert_eq!(backend.hits(), 1);
+        let after = store.snapshot();
+        assert_eq!(after.models, before.models);
+        assert_eq!(after.etag.as_deref(), Some("W/\"v1\""));
+        assert_eq!(before.fetched_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_ne!(after.fetched_at, before.fetched_at);
 
-        // The file written after the 304 still loads with its models and etag.
+        // The 304 rewrote the file with the new fetched_at.
         let reloaded = fixture.store(None).snapshot();
         assert_eq!(reloaded.source, CatalogSource::Proxy);
-        assert_eq!(reloaded.models, first.models);
+        assert_eq!(reloaded.models, before.models);
         assert_eq!(reloaded.etag.as_deref(), Some("W/\"v1\""));
+        assert_eq!(reloaded.fetched_at, after.fetched_at);
+    }
+
+    #[tokio::test]
+    async fn client_version_change_fetches_without_if_none_match() {
+        let fixture = Fixture::new();
+        fixture.write_proxy_catalog("2026-01-01T00:00:00Z", "W/\"v1\"", "0.150.0");
+        let backend = Backend::start(|request| {
+            if request.to_ascii_lowercase().contains("if-none-match") {
+                "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            } else {
+                with_etag(
+                    "200 OK",
+                    "W/\"v1\"",
+                    r#"{"models": [{"slug": "gpt-9-gated-test", "visibility": "list", "supported_in_api": true}]}"#,
+                )
+            }
+        });
+        let store = fixture.store_with_version(Some(backend.fetcher()), Some("0.160.0"));
+
+        assert_eq!(
+            store.refresh(RefreshTrigger::Manual).await,
+            Ok(RefreshOutcome::Updated { models: 1 })
+        );
+        let request = backend.last_request().to_ascii_lowercase();
+        assert!(request.contains("client_version=0.160.0"));
+        assert!(!request.contains("if-none-match"));
+        let snapshot = store.snapshot();
+        assert!(snapshot.accepts("gpt-9-gated-test"));
+        assert_eq!(snapshot.client_version.as_deref(), Some("0.160.0"));
+    }
+
+    #[tokio::test]
+    async fn unauthorized_keeps_catalog_and_never_refreshes_the_login() {
+        let fixture = Fixture::new();
+        fixture.write_cli_cache();
+        let token_endpoint = Backend::start(|_| json_response(500, "{}"));
+        let backend = Backend::start(|_| json_response(401, r#"{"error": "unauthorized"}"#));
+        let store = fixture.store(Some(backend.fetcher_with(
+            u64::MAX / 2,
+            format!("{}/oauth/token", token_endpoint.server.url),
+        )));
+        let before = store.snapshot();
+
+        let error = store.refresh(RefreshTrigger::Manual).await.unwrap_err();
+        assert_eq!(error.reason, "unauthorized");
+        assert_eq!(backend.hits(), 1, "no retry after 401");
+        assert_eq!(token_endpoint.hits(), 0, "no token refresh");
+        assert_eq!(store.snapshot().models, before.models);
+        assert_eq!(store.snapshot().source, CatalogSource::CodexCliCache);
+    }
+
+    #[tokio::test]
+    async fn expired_token_skips_the_fetch_and_never_refreshes_the_login() {
+        let fixture = Fixture::new();
+        fixture.write_cli_cache();
+        let token_endpoint = Backend::start(|_| json_response(500, "{}"));
+        let backend = Backend::start(|_| json_response(200, BACKEND_BODY));
+        let store = fixture.store(Some(
+            backend.fetcher_with(1, format!("{}/oauth/token", token_endpoint.server.url)),
+        ));
+
+        let error = store.refresh(RefreshTrigger::Manual).await.unwrap_err();
+        assert_eq!(error.reason, "auth_unavailable");
+        assert!(!store.refresh_for_unknown_model("gpt-8-test").await);
+        assert_eq!(backend.hits(), 0);
+        assert_eq!(token_endpoint.hits(), 0);
+        assert_eq!(store.snapshot().source, CatalogSource::CodexCliCache);
+    }
+
+    #[tokio::test]
+    async fn identity_from_seed_or_response_is_not_written() {
+        let fixture = Fixture::new();
+        fixture.write_cli_cache();
+        let body = r#"{"identity": "private-identity-from-backend", "models": [
+            {"slug": "gpt-8-test", "visibility": "list", "supported_in_api": true}
+        ]}"#;
+        let backend = Backend::start(move |_| json_response(200, body));
+        let store = fixture.store(Some(backend.fetcher()));
+        assert_eq!(store.snapshot().source, CatalogSource::CodexCliCache);
+
+        store.refresh(RefreshTrigger::Manual).await.unwrap();
+        let written = std::fs::read_to_string(fixture.proxy_path()).unwrap();
+        assert!(written.contains("gpt-8-test"));
+        assert!(!written.contains("identity"));
+        assert!(!written.contains("private-identity"));
+    }
+
+    #[test]
+    fn missing_hardcoded_targets_names_absent_alias_and_upgrade_targets() {
+        assert!(missing_hardcoded_targets(&CatalogSnapshot::static_fallback()).is_empty());
+        let fixture = Fixture::new();
+        fixture.write_cli_cache();
+        assert_eq!(
+            missing_hardcoded_targets(&fixture.store(None).snapshot()),
+            ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-luna", "gpt-6-sol"]
+        );
     }
 
     #[test]

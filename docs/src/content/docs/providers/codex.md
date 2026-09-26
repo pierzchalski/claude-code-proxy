@@ -42,7 +42,7 @@ Use `claude-code-proxy models` as the current catalog. Model access depends on y
 
 The Codex model list is not built into the proxy. It comes from a catalog, read from the first of these that exists:
 
-1. The proxy's own catalog, `<state-root>/codex/models_catalog.json`. The proxy fetches it from the Codex backend's `/models` endpoint, the one the Codex CLI uses, with your Codex login. It sends the stored ETag as `If-None-Match` and keeps the stored models on `304 Not Modified`.
+1. The proxy's own catalog, `<state-root>/codex/models_catalog.json`. The proxy fetches it from the Codex backend's `/models` endpoint, the one the Codex CLI uses, with your Codex login. When the stored catalog was fetched with the same `client_version`, it sends the stored ETag as `If-None-Match` and keeps the stored models on `304 Not Modified`. The catalog fetch never refreshes the login: if the stored access token has expired or `/models` answers `401`, the fetch is skipped and the next Codex request refreshes the token as usual.
 2. The Codex CLI's model cache, `$CODEX_HOME/models_cache.json` or `~/.codex/models_cache.json`. The proxy only reads it, as a starting point until its first successful fetch.
 3. A static list compiled into the proxy, used only when neither file exists, such as a first start with no network and no Codex CLI.
 
@@ -52,7 +52,7 @@ For each model the catalog decides:
 - whether it is listed by `claude-code-proxy models` and `GET /v1/models`: `visibility` is `list`. Each listed model is also listed with a `-fast` suffix.
 - which Responses lane it uses: `use_responses_lite`.
 
-The proxy refreshes the catalog when the server starts (in the background; requests are served meanwhile), every three hours, and when a request names a model that no provider accepts. That last refresh runs at most once a minute; concurrent requests for the same unknown model wait for one fetch. A failed refresh keeps the previous catalog and logs one `codex model catalog refresh failed` line to `proxy.log`. A successful one logs `codex model catalog refreshed` with the added and removed slugs, and a model that became usable through a request-triggered refresh logs `model accepted from catalog`.
+The proxy refreshes the catalog when the server starts (in the background; requests are served meanwhile), every three hours, and when a request names a model that no provider accepts. That last refresh runs at most once a minute; concurrent requests for the same unknown model wait for one fetch. A failed refresh keeps the previous catalog and logs one `codex model catalog refresh failed` line to `proxy.log`, whose `reason` is, for example, `auth_unavailable`, `unauthorized`, or `http_status`. After a successful refresh, `codex model catalog lacks hardcoded targets` names any alias, auto-review, or web-search upgrade target the new catalog does not accept. A successful one logs `codex model catalog refreshed` with the added and removed slugs, and a model that became usable through a request-triggered refresh logs `model accepted from catalog`.
 
 `claude-code-proxy codex models` prints the catalog in use: its source, file, `fetched_at`, ETag, the `client_version` recorded with it, and for each model its lane, whether it is listed, whether it is accepted, and its context window. `claude-code-proxy codex models --refresh` fetches first and exits with status 1 if the fetch fails.
 

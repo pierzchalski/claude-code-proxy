@@ -27,7 +27,10 @@ impl<S: CodexAuthStorage> CodexAuthManager<S> {
         Self::new_with_token_endpoint(store, format!("{ISSUER}/oauth/token"))
     }
 
-    fn new_with_token_endpoint(store: CodexTokenStore<S>, token_endpoint: String) -> Self {
+    pub(crate) fn new_with_token_endpoint(
+        store: CodexTokenStore<S>,
+        token_endpoint: String,
+    ) -> Self {
         Self {
             store,
             #[cfg(test)]
@@ -63,6 +66,11 @@ impl<S: CodexAuthStorage> CodexAuthManager<S> {
 
     pub async fn force_refresh(&self, rejected_access: &str) -> Result<StoredAuth, anyhow::Error> {
         self.refresh(true, Some(rejected_access)).await
+    }
+
+    /// The stored credential as-is: no expiry check and no refresh.
+    pub fn stored_auth(&self) -> Result<Option<StoredAuth>, anyhow::Error> {
+        self.load_auth()
     }
 
     fn load_auth(&self) -> Result<Option<StoredAuth>, anyhow::Error> {
