@@ -1,24 +1,19 @@
-use std::collections::HashSet;
-
 use crate::config;
+use crate::providers::codex::catalog;
 
 use super::request::ServiceTier;
 
-pub const ALLOWED_MODELS: &[&str] = &[
-    "gpt-5.2",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.5",
-    "gpt-5.6-luna",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-6-astra",
-    "gpt-6-luna",
-    "gpt-6-sol",
-];
+/// Allowed models come from the model catalog (`supported_in_api`).
+pub fn allowed_models() -> Vec<String> {
+    catalog::current().allowed_slugs()
+}
 
+pub fn allowed_models_display() -> String {
+    allowed_models().join(", ")
+}
+
+/// The one alias table: Anthropic-style names and their Codex targets. The
+/// registry routes these names to the alias provider.
 pub const MODEL_ALIASES: &[(&str, &str)] = &[
     ("haiku", "gpt-6-luna"),
     ("claude-haiku-4-5", "gpt-6-luna"),
@@ -41,14 +36,16 @@ pub struct ResolvedModel {
     pub service_tier: Option<ServiceTier>,
 }
 
-fn fast_model_aliases() -> HashSet<String> {
-    ALLOWED_MODELS.iter().map(|m| format!("{m}-fast")).collect()
+/// `<slug>-fast` for an allowed `<slug>` resolves to that slug on the
+/// priority tier.
+pub fn fast_model_base(model: &str) -> Option<&str> {
+    model
+        .strip_suffix("-fast")
+        .filter(|base| catalog::current().is_allowed(base))
 }
 
 fn resolve_fast_model_alias(model: &str) -> ResolvedModel {
-    let fast_set = fast_model_aliases();
-    if fast_set.contains(model) {
-        let base = model.trim_end_matches("-fast");
+    if let Some(base) = fast_model_base(model) {
         ResolvedModel {
             model: base.to_string(),
             service_tier: Some(ServiceTier::Priority),
@@ -111,7 +108,7 @@ impl std::fmt::Display for ModelNotAllowedError {
 }
 
 pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
-    if ALLOWED_MODELS.contains(&model) {
+    if catalog::current().is_allowed(model) {
         Ok(())
     } else {
         Err(ModelNotAllowedError {
@@ -120,39 +117,35 @@ pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
     }
 }
 
+/// The catalog's `use_responses_lite`; models missing from it use the full lane.
 pub fn uses_responses_lite(model: &str) -> bool {
-    matches!(
-        model,
-        "gpt-5.6-luna"
-            | "gpt-5.6-sol"
-            | "gpt-5.6-terra"
-            | "gpt-6-astra"
-            | "gpt-6-luna"
-            | "gpt-6-sol"
-    )
+    catalog::current().uses_responses_lite(model)
 }
 
 /// Luna models exist only behind the Responses Lite lane; the full
 /// Responses API resolves them to a `-free` variant and returns 404 (Model not
 /// found gpt-5.6-luna-free-...). Hosted web_search requests must run on the
-/// full lane, so luna is upgraded to its nearest full-lane sibling.
+/// full lane, so luna is upgraded to its nearest full-lane sibling. The
+/// catalog does not say which lite-lane models also exist on the full lane
+/// (its `supports_search_tool` is about tool search, not hosted web search),
+/// so this stays a static table.
+const LITE_ONLY_WEB_SEARCH_UPGRADES: &[(&str, &str)] =
+    &[("gpt-5.6-luna", "gpt-5.6-sol"), ("gpt-6-luna", "gpt-6-sol")];
+
 pub fn full_lane_web_search_model(model: &str) -> &str {
-    match model {
-        "gpt-5.6-luna" => "gpt-5.6-sol",
-        "gpt-6-luna" => "gpt-6-sol",
-        _ => model,
-    }
+    LITE_ONLY_WEB_SEARCH_UPGRADES
+        .iter()
+        .find(|(lite_only, _)| *lite_only == model)
+        .map(|(_, full_lane)| *full_lane)
+        .unwrap_or(model)
+}
+
+pub fn is_alias(model: &str) -> bool {
+    MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)
 }
 
 pub fn is_valid_model_for_codex(model: &str) -> bool {
-    if ALLOWED_MODELS.contains(&model) {
-        return true;
-    }
-    let fast_set = fast_model_aliases();
-    if fast_set.contains(model) {
-        return true;
-    }
-    MODEL_ALIASES.iter().any(|(alias, _)| *alias == model)
+    catalog::current().accepts(model) || is_alias(model)
 }
 
 #[cfg(test)]

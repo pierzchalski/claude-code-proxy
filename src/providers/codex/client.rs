@@ -525,6 +525,12 @@ const IMAGE_HEADER_TIMEOUT_MS: u64 = 300_000;
 /// out, so the retry classifiers can tell it apart from a transport failure.
 const HTTP_RESPONSE_HEADERS_DETAIL: &str = "http_response_headers";
 
+/// A client builder with the same proxy environment handling as the Codex
+/// HTTP client.
+pub(crate) fn proxied_client_builder() -> reqwest::ClientBuilder {
+    ProxyEnvironment::from_env().apply(reqwest::Client::builder())
+}
+
 #[derive(Clone)]
 struct ProxyEnvironment {
     http_proxy: Option<String>,

@@ -6,24 +6,8 @@ use crate::{
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use axum::{http::StatusCode, response::Response};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-
-pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
-    "haiku",
-    "claude-haiku-4-5",
-    "claude-haiku-4-5-20251001",
-    "sonnet",
-    "claude-sonnet-4-6",
-    "claude-sonnet-5",
-    "opus",
-    "claude-opus-4-7",
-    "claude-opus-4-8",
-    "claude-opus-5",
-    "claude-opus-5-5",
-    "fable",
-    "claude-fable-5",
-];
 
 pub const CURSOR_PREFIXES: &[&str] = &["cursor:", "cursor-plan:", "cursor-ask:"];
 
@@ -38,35 +22,22 @@ const CURSOR_LEGACY_MODELS: &[&str] = &[
     "composer-2.5-fast",
 ];
 
-pub(crate) const CODEX_MODELS: &[&str] = &[
-    "gpt-5.2",
-    "gpt-5.3-codex",
-    "gpt-5.3-codex-spark",
-    "gpt-5.4",
-    "gpt-5.4-mini",
-    "gpt-5.5",
-    "gpt-5.6-luna",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-6-astra",
-    "gpt-6-luna",
-    "gpt-6-sol",
-];
-
 pub(crate) const KIMI_MODELS: &[&str] = &["kimi-for-coding", "kimi-k2.6", "kimi-k3", "k2.6", "k3"];
 pub(crate) const GROK_MODELS: &[&str] =
     &["grok-composer-2.5-fast", "grok-4.5", "grok-4.6", "grok-4.7"];
 
 pub struct Registry {
     alias_provider: AliasProvider,
+    /// Fixed model lists, keyed by provider.
     models: BTreeMap<String, Vec<String>>,
+    /// Providers whose models are asked for live (the Codex catalog).
+    live: BTreeSet<String>,
     handlers: BTreeMap<String, Arc<dyn Provider>>,
 }
 
 impl Registry {
     pub fn new(alias_provider: AliasProvider) -> Self {
         let mut models: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        models.insert("codex".into(), expand_codex_models());
         models.insert(
             "kimi".into(),
             KIMI_MODELS.iter().map(|m| (*m).to_string()).collect(),
@@ -87,7 +58,6 @@ impl Registry {
         let mut handlers = BTreeMap::new();
         for (name, entries) in &models {
             let handler: Arc<dyn Provider> = match name.as_str() {
-                "codex" => Arc::new(crate::providers::codex::CodexProvider::new()),
                 "kimi" => Arc::new(crate::providers::kimi::KimiProvider::new()),
                 "cursor" => Arc::new(crate::providers::cursor::CursorProvider::new()),
                 "grok" => Arc::new(crate::providers::grok::GrokProvider::new()),
@@ -96,10 +66,14 @@ impl Registry {
             };
             handlers.insert(name.clone(), handler);
         }
+        let codex: Arc<dyn Provider> = Arc::new(crate::providers::codex::CodexProvider::new());
+        handlers.insert("codex".into(), codex);
+        let live = BTreeSet::from(["codex".to_string()]);
 
         Self {
             alias_provider,
             models,
+            live,
             handlers,
         }
     }
@@ -122,6 +96,7 @@ impl Registry {
         Self {
             alias_provider,
             models,
+            live: BTreeSet::new(),
             handlers,
         }
     }
@@ -137,11 +112,18 @@ impl Registry {
     }
 
     pub fn supported_models_for(&self, provider: &str) -> Vec<String> {
-        let mut models = self.models.get(provider).cloned().unwrap_or_default();
+        let mut models = if self.live.contains(provider) {
+            self.handlers
+                .get(provider)
+                .map(|handler| handler.supported_models())
+                .unwrap_or_default()
+        } else {
+            self.models.get(provider).cloned().unwrap_or_default()
+        };
         if provider == self.alias_provider.as_str() {
-            for alias in ANTHROPIC_STYLE_ALIASES {
+            for alias in anthropic_style_aliases() {
                 if !models.iter().any(|value| value == alias) {
-                    models.push((*alias).to_string());
+                    models.push(alias.to_string());
                 }
             }
         }
@@ -181,12 +163,38 @@ impl Registry {
             return self.handlers.get("cursor").cloned();
         }
 
-        for (name, models) in &self.models {
-            if models.iter().any(|candidate| candidate == &normalized) {
-                return self.handlers.get(name).cloned();
+        self.handlers
+            .iter()
+            .find(|(name, handler)| {
+                if self.live.contains(name.as_str()) {
+                    handler.accepts_model(&normalized)
+                } else {
+                    self.models
+                        .get(name.as_str())
+                        .is_some_and(|models| models.iter().any(|m| m == &normalized))
+                }
+            })
+            .map(|(_, handler)| handler.clone())
+    }
+
+    /// `provider_for_model`, and on a miss, lets live-catalog providers
+    /// refresh once and retries.
+    pub async fn provider_for_model_or_refresh(
+        &self,
+        raw_model: &str,
+        session_affinity: Option<&AliasProvider>,
+    ) -> Option<Arc<dyn Provider>> {
+        if let Some(provider) = self.provider_for_model(raw_model, session_affinity) {
+            return Some(provider);
+        }
+        let normalized = normalize_incoming_model(raw_model);
+        for name in &self.live {
+            if let Some(handler) = self.handlers.get(name)
+                && handler.refresh_models_for(&normalized).await
+            {
+                return Some(handler.clone());
             }
         }
-
         None
     }
 
@@ -209,8 +217,16 @@ pub fn normalize_incoming_model(model: &str) -> String {
     model.to_string()
 }
 
+/// The Anthropic-style names (`opus`, `claude-sonnet-5`, ...) routed to the
+/// alias provider; the single table is the Codex alias map.
+pub fn anthropic_style_aliases() -> impl Iterator<Item = &'static str> {
+    crate::providers::codex::translate::model_allowlist::MODEL_ALIASES
+        .iter()
+        .map(|(alias, _)| *alias)
+}
+
 pub fn is_anthropic_alias(model: &str) -> bool {
-    ANTHROPIC_STYLE_ALIASES.contains(&model)
+    anthropic_style_aliases().any(|alias| alias == model)
 }
 
 pub fn is_cursor_model(model: &str) -> bool {
@@ -316,22 +332,6 @@ const CODEX_CLI: PlaceholderCli = PlaceholderCli { provider: "codex" };
 const KIMI_CLI: PlaceholderCli = PlaceholderCli { provider: "kimi" };
 const CURSOR_CLI: PlaceholderCli = PlaceholderCli { provider: "cursor" };
 const GROK_CLI: PlaceholderCli = PlaceholderCli { provider: "grok" };
-fn expand_codex_models() -> Vec<String> {
-    let mut set = HashSet::new();
-    let mut out = Vec::new();
-    for model in CODEX_MODELS {
-        if set.insert((*model).to_string()) {
-            out.push((*model).to_string());
-        }
-        let fast = format!("{model}-fast");
-        if set.insert(fast.clone()) {
-            out.push(fast);
-        }
-    }
-    out.sort_unstable();
-    out
-}
-
 fn build_cursor_models() -> Vec<String> {
     let mut out: Vec<String> = CURSOR_LEGACY_MODELS
         .iter()

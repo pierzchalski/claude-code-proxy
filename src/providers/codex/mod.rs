@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod catalog;
 pub mod chat_completions;
 pub mod client;
 pub mod compaction;
@@ -29,7 +30,6 @@ use crate::config;
 use crate::logging::create_logger;
 use crate::monitor::usage_from_anthropic_sse;
 use crate::provider::{CliHandlers, Provider, RequestContext};
-use crate::registry;
 use crate::request_identity::ConversationIdentity;
 use crate::retry::{compute_backoff_delay, sleep};
 
@@ -542,17 +542,19 @@ impl Provider for CodexProvider {
         "codex"
     }
 
+    /// Listed catalog models and their `-fast` siblings.
     fn supported_models(&self) -> Vec<String> {
-        let mut models: Vec<String> = registry::CODEX_MODELS
-            .iter()
-            .map(|m| m.to_string())
-            .collect();
-        for m in registry::CODEX_MODELS {
-            models.push(format!("{m}-fast"));
-        }
-        models.sort_unstable();
-        models.dedup();
-        models
+        catalog::current().advertised_models()
+    }
+
+    /// Any catalog model the backend accepts, listed or hidden, and its
+    /// `-fast` sibling.
+    fn accepts_model(&self, model: &str) -> bool {
+        catalog::current().accepts(model)
+    }
+
+    async fn refresh_models_for(&self, model: &str) -> bool {
+        catalog::refresh_for_unknown_model(model).await
     }
 
     fn cli(&self) -> &'static dyn CliHandlers {

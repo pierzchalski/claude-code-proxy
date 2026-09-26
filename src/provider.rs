@@ -25,6 +25,22 @@ pub enum AuthCommand {
 pub trait Provider: Send + Sync {
     fn name(&self) -> &'static str;
     fn supported_models(&self) -> Vec<String>;
+
+    /// Whether requests naming `model` route here. Defaults to the advertised
+    /// list; a provider with a live catalog also accepts unlisted models.
+    fn accepts_model(&self, model: &str) -> bool {
+        self.supported_models()
+            .iter()
+            .any(|candidate| candidate == model)
+    }
+
+    /// Called when no provider accepts `model`: a provider with a live catalog
+    /// may refresh it. Returns whether this provider now accepts `model`.
+    async fn refresh_models_for(&self, model: &str) -> bool {
+        let _ = model;
+        false
+    }
+
     fn cli(&self) -> &'static dyn CliHandlers;
     async fn handle_messages(&self, body: MessagesRequest, ctx: RequestContext) -> Response;
 

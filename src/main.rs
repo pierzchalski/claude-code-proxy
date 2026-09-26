@@ -4,7 +4,8 @@ use claude_code_proxy::{
     config, logging,
     monitor::MonitorHandle,
     paths,
-    registry::{ANTHROPIC_STYLE_ALIASES, Registry},
+    providers::codex::catalog,
+    registry::{Registry, anthropic_style_aliases},
     server::{self, ServerConfig},
     tui::{self, MonitorExit, MonitorUiConfig},
 };
@@ -51,10 +52,10 @@ enum Commands {
         #[arg(long)]
         full: bool,
     },
-    /// Manage Codex authentication
+    /// Manage Codex authentication and the Codex model catalog
     Codex {
         #[command(subcommand)]
-        command: ProviderGroup,
+        command: CodexGroup,
     },
     /// Manage Kimi authentication
     Kimi {
@@ -70,6 +71,20 @@ enum Commands {
     Grok {
         #[command(subcommand)]
         command: ProviderGroup,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum CodexGroup {
+    Auth {
+        #[command(subcommand)]
+        command: claude_code_proxy::provider::AuthCommand,
+    },
+    /// Show the Codex model catalog: source, fetch time, and each model's lane
+    Models {
+        /// Fetch the catalog from the Codex backend before printing
+        #[arg(long)]
+        refresh: bool,
     },
 }
 
@@ -102,6 +117,7 @@ fn main() -> Result<()> {
         Commands::Serve { port, no_monitor } => {
             let bind_address = config::bind_address();
             let effective_port = port.unwrap_or_else(config::port);
+            catalog::install_from_environment();
             let registry = Registry::with_default_alias();
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -183,10 +199,16 @@ fn main() -> Result<()> {
             Ok(())
         }
         Commands::Models { full } => {
+            catalog::install_from_environment();
             print_models(&Registry::with_default_alias(), full);
             Ok(())
         }
-        Commands::Codex { command } => run_provider_cli("codex", command),
+        Commands::Codex { command } => match command {
+            CodexGroup::Auth { command } => {
+                run_provider_cli("codex", ProviderGroup::Auth { command })
+            }
+            CodexGroup::Models { refresh } => run_codex_models(refresh),
+        },
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
         Commands::Grok { command } => run_provider_cli("grok", command),
@@ -326,6 +348,33 @@ fn run_provider_cli(name: &str, command: ProviderGroup) -> Result<()> {
     }
 }
 
+fn run_codex_models(refresh: bool) -> Result<()> {
+    let store = catalog::install_from_environment();
+    let mut refresh_failed = false;
+    if refresh {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        match runtime.block_on(store.refresh(catalog::RefreshReason::Manual)) {
+            Ok(catalog::RefreshOutcome::Updated { models }) => {
+                println!("refresh: fetched {models} models");
+            }
+            Ok(catalog::RefreshOutcome::NotModified) => {
+                println!("refresh: not modified (ETag matched)");
+            }
+            Err(error) => {
+                println!("refresh failed: {error}");
+                refresh_failed = true;
+            }
+        }
+    }
+    print!("{}", catalog::describe(&store.snapshot()));
+    if refresh_failed {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn print_models(registry: &Registry, full: bool) {
     let grouped = registry.grouped_models();
     for provider in ["codex", "kimi", "grok", "opencode", "cursor"] {
@@ -389,7 +438,7 @@ fn print_server_banner(bind_address: &str, port: u16, registry: &Registry) {
 
 #[allow(dead_code)]
 fn alias_names() -> usize {
-    ANTHROPIC_STYLE_ALIASES.len()
+    anthropic_style_aliases().count()
 }
 
 #[cfg(test)]
