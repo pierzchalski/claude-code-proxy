@@ -1142,6 +1142,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_misses_for_one_model_share_one_fetch() {
+        let fixture = Fixture::new();
+        let backend = Backend::start(|_| json_response(200, BACKEND_BODY));
+        let store = fixture.store(Some(backend.fetcher()));
+
+        let (first, second) = tokio::join!(
+            store.refresh_for_unknown_model("gpt-8-test"),
+            store.refresh_for_unknown_model("gpt-8-test"),
+        );
+        assert!(first && second);
+        assert_eq!(backend.hits(), 1);
+    }
+
+    #[tokio::test]
     async fn not_supported_in_api_stays_rejected_after_refresh() {
         let fixture = Fixture::new();
         let backend = Backend::start(|_| json_response(200, BACKEND_BODY));
