@@ -175,14 +175,49 @@ pub(crate) fn apply_refreshed_tokens(
 }
 
 fn overwrite_file_in_place(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(contents)?;
-    file.sync_all()?;
-    Ok(())
+    overwrite_in_place_with(path, contents, |file, bytes| {
+        use std::io::Write;
+        file.write_all(bytes)
+    })
+}
+
+/// Overwrite `path` without truncating first: write `contents` from the start,
+/// fsync, then cut the file to length. If any step fails, write the original
+/// bytes back, so the file holds either the old or the new document, never a
+/// truncated or mixed one (unless that restore fails too, which is reported).
+fn overwrite_in_place_with(
+    path: &Path,
+    contents: &[u8],
+    write: impl Fn(&mut fs::File, &[u8]) -> io::Result<()>,
+) -> anyhow::Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let mut original = Vec::new();
+    file.read_to_end(&mut original)?;
+
+    let attempt = |file: &mut fs::File, bytes: &[u8]| -> io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        write(file, bytes)?;
+        file.sync_all()?;
+        file.set_len(bytes.len() as u64)?;
+        file.sync_all()
+    };
+    let Err(write_err) = attempt(&mut file, contents) else {
+        return Ok(());
+    };
+    let restored = (|| -> io::Result<()> {
+        use std::io::Write;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&original)?;
+        file.set_len(original.len() as u64)?;
+        file.sync_all()
+    })();
+    match restored {
+        Ok(()) => Err(write_err.into()),
+        Err(restore_err) => Err(anyhow::anyhow!(
+            "{write_err}; restoring the previous contents also failed: {restore_err}"
+        )),
+    }
 }
 
 fn now_rfc3339() -> anyhow::Result<String> {
@@ -645,5 +680,41 @@ mod tests {
         let stored = store.save_refreshed(&previous, refreshed(), None).unwrap();
         assert_eq!(stored, refreshed());
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    /// Writes the first half of the bytes, then fails like a full disk.
+    fn write_half_then_fail(file: &mut fs::File, bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write;
+        file.write_all(&bytes[..bytes.len() / 2])?;
+        Err(io::Error::new(
+            io::ErrorKind::StorageFull,
+            "simulated full disk mid-write",
+        ))
+    }
+
+    #[test]
+    fn in_place_write_failure_leaves_original_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write(&dir, &cli_file("old-access", "old-refresh"));
+        let original = fs::read(&path).unwrap();
+        for new_len in [original.len() / 3, original.len() * 3] {
+            let replacement = vec![b'x'; new_len];
+            let err = overwrite_in_place_with(&path, &replacement, write_half_then_fail)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("simulated full disk mid-write"), "{err}");
+            assert_eq!(fs::read(&path).unwrap(), original, "new_len {new_len}");
+        }
+    }
+
+    #[test]
+    fn in_place_write_replaces_longer_and_shorter_documents() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("auth.json");
+        fs::write(&path, "0123456789").unwrap();
+        overwrite_file_in_place(&path, b"abc").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"abc");
+        overwrite_file_in_place(&path, b"a much longer document").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"a much longer document");
     }
 }
