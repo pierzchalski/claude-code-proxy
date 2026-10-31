@@ -17,6 +17,8 @@ Windows falls back to `%USERPROFILE%/AppData/Roaming` and `%USERPROFILE%/AppData
 
 `CCP_CONFIG_DIR` replaces the configuration root for the current process. It does not change the state root.
 
+`CCP_STATE_DIR` replaces the state root for the current process, on every platform. It does not change the configuration root.
+
 ## Configuration
 
 `config.json` lives directly under the configuration root. See [Configuration](/reference/configuration/) for its schema and precedence.
@@ -55,7 +57,7 @@ Kimi stores a persistent UUID at `<configuration-root>/kimi/device_id` for file-
 
 `proxy.log` lives under the state root. It uses JSON Lines and rotates at 20 MiB. Known credential keys, including authorization, access tokens, refresh tokens, ID tokens, and account headers, are redacted before writing.
 
-A Homebrew service also writes `service.log` under the state root.
+A Homebrew service also writes `service.log` under `${XDG_STATE_HOME:-~/.local/state}/claude-code-proxy`; that path is fixed in the service definition and does not follow `CCP_STATE_DIR`.
 
 ## Failed responses
 

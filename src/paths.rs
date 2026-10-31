@@ -47,6 +47,10 @@ pub fn resolve_config_dir(deps: &DirResolverEnv) -> PathBuf {
 }
 
 pub fn resolve_state_dir(deps: &DirResolverEnv) -> PathBuf {
+    if let Some(override_dir) = deps.env.get("CCP_STATE_DIR").filter(|dir| !dir.is_empty()) {
+        return Path::new(override_dir).to_path_buf();
+    }
+
     if deps.platform == "win32" {
         let local = deps
             .env
@@ -150,4 +154,52 @@ pub fn resolve_state_dir_for_env(
         env: env.clone(),
         home: home.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn state_dir_override_replaces_xdg_state_home() {
+        let vars = env(&[("CCP_STATE_DIR", "/s"), ("XDG_STATE_HOME", "/x")]);
+        assert_eq!(
+            resolve_state_dir_for_env("linux", "/home/u", &vars),
+            PathBuf::from("/s")
+        );
+    }
+
+    #[test]
+    fn state_dir_override_replaces_localappdata_on_windows() {
+        let vars = env(&[("CCP_STATE_DIR", "/s"), ("LOCALAPPDATA", "/l")]);
+        assert_eq!(
+            resolve_state_dir_for_env("win32", "/home/u", &vars),
+            PathBuf::from("/s")
+        );
+    }
+
+    #[test]
+    fn empty_state_dir_override_is_ignored() {
+        let vars = env(&[("CCP_STATE_DIR", ""), ("XDG_STATE_HOME", "/x")]);
+        assert_eq!(
+            resolve_state_dir_for_env("linux", "/home/u", &vars),
+            PathBuf::from("/x/claude-code-proxy")
+        );
+    }
+
+    #[test]
+    fn state_dir_override_does_not_move_config_dir() {
+        let vars = env(&[("CCP_STATE_DIR", "/s"), ("XDG_CONFIG_HOME", "/c")]);
+        assert_eq!(
+            resolve_config_dir_for_env("linux", "/home/u", &vars),
+            PathBuf::from("/c/claude-code-proxy")
+        );
+    }
 }

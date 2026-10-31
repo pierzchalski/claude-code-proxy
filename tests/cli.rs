@@ -22,7 +22,7 @@ trait IsolateEnv {
 impl IsolateEnv for Command {
     fn isolate_env(&mut self, dir: &std::path::Path) -> &mut Self {
         self.env("CCP_CONFIG_DIR", dir.join("config"))
-            .env("XDG_STATE_HOME", dir.join("state"))
+            .env("CCP_STATE_DIR", dir.join("state"))
             .env("CODEX_HOME", dir.join("codex-home"))
             .env_remove("CCP_CODEX_AUTH_FILE")
     }
@@ -31,7 +31,7 @@ impl IsolateEnv for Command {
 impl IsolateEnv for std::process::Command {
     fn isolate_env(&mut self, dir: &std::path::Path) -> &mut Self {
         self.env("CCP_CONFIG_DIR", dir.join("config"))
-            .env("XDG_STATE_HOME", dir.join("state"))
+            .env("CCP_STATE_DIR", dir.join("state"))
             .env("CODEX_HOME", dir.join("codex-home"))
             .env_remove("CCP_CODEX_AUTH_FILE")
     }

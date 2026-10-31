@@ -65,6 +65,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 | `CCP_BIND_ADDRESS` | `bindAddress` | `127.0.0.1` | Listener IP address. |
 | `PORT` | `port` | `18765` | Listener port. |
 | `CCP_CONFIG_DIR` | none | Platform config directory | Replaces the configuration and file-backed auth root. |
+| `CCP_STATE_DIR` | none | Platform state directory | Replaces the state root (logs, error dumps, traffic captures, model catalog cache). Ignored when empty. |
 | `CCP_ALIAS_PROVIDER` | `aliasProvider` | `codex` | Routes recognized Anthropic-style aliases through `codex` or `kimi`. |
 | `CCP_AUTO_REVIEW_MODEL` | `autoReviewModel` | `gpt-6-luna` for Codex | Routes Claude Code's non-streaming, tool-free Bash security-review classifier through a registered model. |
 | `CCP_LOG_STDERR` | `log.stderr` | `false` | Mirrors logs to stderr when present in the environment, regardless of its value. |
@@ -72,7 +73,7 @@ All keys are optional. An unreadable file, malformed JSON, or incompatible field
 | `CCP_TRAFFIC_LOG` | none | `false` | Enables full request captures for `1`, `true`, or `yes`. |
 | `XDG_STATE_HOME` | none | `~/.local/state` | State base on macOS and Linux. |
 
-`CCP_CONFIG_DIR` affects `config.json` and file-backed provider auth. It does not relocate the state directory.
+`CCP_CONFIG_DIR` affects `config.json` and file-backed provider auth. It does not relocate the state directory. `CCP_STATE_DIR` relocates the state directory and does not affect configuration.
 
 Codex auto-review classifier requests use `gpt-6-luna` by default. Requests routed through other providers retain their requested model. `CCP_AUTO_REVIEW_MODEL` or `autoReviewModel` selects an explicit registered model for all detected classifier requests without changing the session's provider affinity. Normal messages, streaming requests, tool-using requests, and token counting retain their requested model.
 

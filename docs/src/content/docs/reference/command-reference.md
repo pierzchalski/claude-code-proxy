@@ -108,4 +108,6 @@ just check
 just docs
 ```
 
+Processes started by cargo (`cargo run`, `cargo test`) use `target/ccp-state` as the state root via `.cargo/config.toml`; export `CCP_STATE_DIR` to override.
+
 `just docs` installs the locked documentation dependencies and starts the Astro development server on an available local port.

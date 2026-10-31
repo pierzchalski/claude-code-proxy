@@ -78,6 +78,7 @@ for _attempt in {1..20}; do
   : > "$server_log"
 
   XDG_STATE_HOME="$state_home" \
+  CCP_STATE_DIR="$state_home/claude-code-proxy" \
   CCP_LOG_STDERR=1 \
   CCP_LOG_VERBOSE=1 \
   CCP_TRAFFIC_LOG=1 \

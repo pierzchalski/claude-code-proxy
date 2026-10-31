@@ -1,0 +1,6 @@
+# Processes cargo starts (tests, the binaries they spawn, `cargo run`) keep
+# their state under target/ instead of the user's real state directory, so a
+# test run does not append to the live proxy.log. An exported CCP_STATE_DIR
+# still wins.
+[env]
+CCP_STATE_DIR = { value = "target/ccp-state", relative = true }
