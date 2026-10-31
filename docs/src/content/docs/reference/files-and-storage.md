@@ -17,6 +17,8 @@ Windows falls back to `%USERPROFILE%/AppData/Roaming` and `%USERPROFILE%/AppData
 
 `CCP_CONFIG_DIR` replaces the configuration root for the current process. It does not change the state root.
 
+`CCP_STATE_DIR` replaces the state root for the current process, on every platform. It does not change the configuration root.
+
 ## Configuration
 
 `config.json` lives directly under the configuration root. See [Configuration](/reference/configuration/) for its schema and precedence.
